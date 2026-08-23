@@ -1,8 +1,8 @@
-FROM rust:1.85-bookworm AS build
+FROM rust:1.88-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --locked --release
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin openstar \

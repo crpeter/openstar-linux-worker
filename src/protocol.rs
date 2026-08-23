@@ -293,7 +293,7 @@ mod tests {
             LombResult {
                 best_frequency: 2.0,
                 best_period_days: 0.5,
-                best_power: 0.9,
+                best_power: 0.875,
                 best_frequency_index: 42,
             },
             1.25,
@@ -304,10 +304,10 @@ mod tests {
             value,
             serde_json::json!({
                 "workUnitID":"work", "nodeID":"node", "status":"completed", "duration":1.25,
-                "payload":{"bestFrequency":2.0,"bestPeriodDays":0.5,"bestPower":0.9,
+                "payload":{"bestFrequency":2.0,"bestPeriodDays":0.5,"bestPower":0.875,
                     "bestFrequencyIndex":42,"cpuDurationSeconds":1.25,"totalWorkloadDurationSeconds":1.25},
                 "errorMessage":null,"failureKind":null,"bestFrequency":2.0,
-                "bestPeriodDays":0.5,"bestPower":0.9
+                "bestPeriodDays":0.5,"bestPower":0.875
             })
         );
     }

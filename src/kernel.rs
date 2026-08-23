@@ -29,7 +29,11 @@ pub fn execute(dataset: &Dataset, p: &LombPayload) -> Result<LombResult, Compute
     if p.frequency_count == 0 {
         return Err(ComputeError::InvalidCount);
     }
-    if !p.start_frequency.is_finite() || !p.frequency_step.is_finite() {
+    if !p.start_frequency.is_finite()
+        || p.start_frequency <= 0.0
+        || !p.frequency_step.is_finite()
+        || p.frequency_step <= 0.0
+    {
         return Err(ComputeError::InvalidFrequency);
     }
     let normalization = values
@@ -53,13 +57,15 @@ pub fn execute(dataset: &Dataset, p: &LombPayload) -> Result<LombResult, Compute
         })
         .try_reduce_with(|left, right| {
             let ordering = right.2.total_cmp(&left.2);
-            if ordering.is_gt() || (ordering.is_eq() && right.0 < left.0) {
-                right
-            } else {
-                left
-            }
-        })?
-        .ok_or(ComputeError::InvalidCount)?;
+            Ok(
+                if ordering.is_gt() || (ordering.is_eq() && right.0 < left.0) {
+                    right
+                } else {
+                    left
+                },
+            )
+        })
+        .ok_or(ComputeError::InvalidCount)??;
     let best_frequency_index = p
         .frequency_start_index
         .checked_add(winner)
@@ -200,21 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn frequency_ties_choose_first_global_index() {
-        let result = execute(
-            &dataset(),
-            &LombPayload {
-                start_frequency: 0.8,
-                frequency_step: 0.0,
-                frequency_count: 8,
-                frequency_start_index: 90,
-            },
-        )
-        .unwrap();
-        assert_eq!(result.best_frequency_index, 90);
-    }
-
-    #[test]
     fn rejects_mismatched_and_nonpositive_frequency_inputs() {
         let mismatch = Dataset {
             coordinates: Some(vec![0.0]),
@@ -246,5 +237,19 @@ mod tests {
             ),
             Err(ComputeError::InvalidFrequency)
         );
+        for frequency_step in [0.0, -0.1] {
+            assert_eq!(
+                execute(
+                    &dataset(),
+                    &LombPayload {
+                        start_frequency: 1.0,
+                        frequency_step,
+                        frequency_count: 2,
+                        frequency_start_index: 0,
+                    }
+                ),
+                Err(ComputeError::InvalidFrequency)
+            );
+        }
     }
 }

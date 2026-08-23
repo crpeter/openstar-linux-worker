@@ -264,13 +264,14 @@ mod tests {
     #[tokio::test]
     async fn transient_submission_reuses_identical_bytes() {
         let server = MockServer::start_async().await;
-        let bytes = br#"{"stable":"body"}"#.to_vec();
+        let body = String::from(r#"{"stable":"body"}"#);
+        let bytes = body.as_bytes().to_vec();
         let first = server
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/v1/work/w/result")
                     .header("content-type", "application/json")
-                    .body(bytes.clone());
+                    .body(body.clone());
                 then.status(503);
             })
             .await;
@@ -295,7 +296,7 @@ mod tests {
                 when.method(POST)
                     .path("/v1/work/w/result")
                     .header("content-type", "application/json")
-                    .body(bytes.clone());
+                    .body(body.clone());
                 then.status(200)
                     .json_body(serde_json::json!({"accepted":true}));
             })
