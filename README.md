@@ -4,11 +4,9 @@ A headless, generic CPU compute worker. It registers with an OpenStar coordinato
 claims opaque work, downloads its referenced dataset, and currently dispatches only
 `openstar.lomb-scargle.v1`. It contains no dataset discovery or science orchestration.
 
-> **Protocol review note:** the requested upstream GitHub repositories could not be
-> reached from the build environment (the HTTPS proxy returned 403). The endpoint
-> names and compatibility rules in the issue are implemented, but registration
-> capability names, failure codes, and exact numerical normalization must be checked
-> against the authoritative current server before deployment.
+The wire models follow the verified `openstarserver/main` contract and the CPU
+kernel follows the Float32 scalar semantics of the validator in `OpenStar/main`.
+Registration supplies a persistent node UUID and advertises only the CPU backend.
 
 ## Build and test
 
@@ -33,7 +31,8 @@ path prefix. CLI flags correspond to the environment keys below; see `--help`.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `OPENSTAR_COORDINATOR_URL` | required | Coordinator base URL |
-| `OPENSTAR_NODE_NAME` | `openstar-linux-worker` | Display name |
+| `OPENSTAR_NODE_ID` | generated | Explicit stable node UUID |
+| `OPENSTAR_STATE_DIR` | `/var/lib/openstar-worker` | Stores generated node identity |
 | `OPENSTAR_WORK_CONCURRENCY` | `1` | Simultaneously claimed units |
 | `OPENSTAR_CPU_THREADS` | host parallelism | Rayon CPU threads |
 | `OPENSTAR_POLL_INTERVAL_MS` | `2000` | Delay after no work |
@@ -43,3 +42,9 @@ path prefix. CLI flags correspond to the environment keys below; see `--help`.
 
 SIGINT/SIGTERM stops claiming; active units finish result submission before exit.
 The worker advertises CPU threads and the one workload only—no GPU capability.
+The service's `StateDirectory` gives its unprivileged user write access to the
+identity directory. Back up `node-id` to preserve coordinator identity when moving
+the worker to a new host, or configure `OPENSTAR_NODE_ID` explicitly.
+
+Tests use only local mock HTTP servers; they never connect to or claim work from a
+live coordinator.

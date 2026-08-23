@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let worker = Worker::new(config)?;
     let (tx, rx) = watch::channel(false);
-    tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -21,6 +21,6 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
         let _ = tx.send(true);
-    });
+    }));
     worker.run(rx).await
 }

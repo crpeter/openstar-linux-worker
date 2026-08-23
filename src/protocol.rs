@@ -6,27 +6,48 @@ pub const LOMB_SCARGLE_V1: &str = "openstar.lomb-scargle.v1";
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registration<'a> {
-    pub name: &'a str,
+    #[serde(rename = "nodeID")]
+    pub node_id: &'a str,
     pub capabilities: Capabilities,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
-    pub workloads: Vec<&'static str>,
-    pub cpu_threads: usize,
+    pub platform: &'static str,
+    pub hardware_identifier: String,
+    pub gpu_name: &'static str,
+    pub processor_count: usize,
+    #[serde(rename = "memoryGB")]
+    pub memory_gb: f32,
+    pub compute_backends: Vec<Backend>,
+    pub workloads: Vec<WorkloadCapability>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistrationResponse {
-    #[serde(alias = "id")]
-    pub node_id: String,
+#[derive(Debug, Serialize)]
+pub struct Backend {
+    pub id: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkloadCapability {
+    #[serde(rename = "workloadID")]
+    pub workload_id: &'static str,
+    pub execution_backends: Vec<Backend>,
+    #[serde(rename = "validatorID")]
+    pub validator_id: Option<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegistrationReceipt {
+    pub accepted: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ClaimRequest<'a> {
+    #[serde(rename = "nodeID")]
     pub node_id: &'a str,
 }
 
@@ -34,13 +55,16 @@ pub struct ClaimRequest<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct WorkUnit {
     pub id: String,
+    #[serde(rename = "projectID")]
     pub project_id: String,
+    #[serde(rename = "workloadID")]
     pub workload_id: String,
+    #[serde(rename = "datasetID")]
     pub dataset_id: String,
     #[serde(default)]
     pub payload: Option<Value>,
     #[serde(default)]
-    pub frequency_start: Option<f32>,
+    pub start_frequency: Option<f32>,
     #[serde(default)]
     pub frequency_step: Option<f32>,
     #[serde(default)]
@@ -50,73 +74,34 @@ pub struct WorkUnit {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ClaimResponse {
-    Empty(Option<WorkUnit>),
-    Wrapped {
-        #[serde(rename = "workUnit")]
-        #[serde(default)]
-        work_unit: Option<WorkUnit>,
-    },
-    Direct(WorkUnit),
-}
-impl ClaimResponse {
-    pub fn work(self) -> Option<WorkUnit> {
-        match self {
-            Self::Empty(v) => v,
-            Self::Wrapped { work_unit } => work_unit,
-            Self::Direct(v) => Some(v),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
 pub struct Dataset {
-    #[serde(alias = "timestamps")]
-    pub times: Vec<f32>,
     #[serde(default)]
-    pub flux: Option<Vec<f32>>,
+    pub coordinates: Option<Vec<f32>>,
     #[serde(default)]
     pub values: Option<Vec<f32>>,
+    #[serde(default)]
+    pub times: Option<Vec<f32>>,
+    #[serde(default)]
+    pub flux: Option<Vec<f32>>,
 }
+
 impl Dataset {
-    pub fn values(&self) -> Option<&[f32]> {
-        self.flux.as_deref().or(self.values.as_deref())
+    pub fn series(&self) -> Option<(&[f32], &[f32])> {
+        match (&self.coordinates, &self.values) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => self.times.as_deref().zip(self.flux.as_deref()),
+        }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LombPayload {
-    pub frequency_start: f32,
+    pub start_frequency: f32,
     pub frequency_step: f32,
     pub frequency_count: usize,
     #[serde(default)]
     pub frequency_start_index: usize,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct LombResult {
-    pub powers: Vec<f32>,
-    pub best_frequency_index: usize,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResultEnvelope<T> {
-    pub workload_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<Failure>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Failure {
-    pub code: &'static str,
-    pub message: String,
 }
 
 impl WorkUnit {
@@ -125,7 +110,7 @@ impl WorkUnit {
             serde_json::from_value(value.clone()).map_err(|e| format!("invalid payload: {e}"))
         } else {
             Ok(LombPayload {
-                frequency_start: self.frequency_start.ok_or("missing frequencyStart")?,
+                start_frequency: self.start_frequency.ok_or("missing startFrequency")?,
                 frequency_step: self.frequency_step.ok_or("missing frequencyStep")?,
                 frequency_count: self.frequency_count.ok_or("missing frequencyCount")?,
                 frequency_start_index: self.frequency_start_index.unwrap_or(0),
@@ -134,75 +119,196 @@ impl WorkUnit {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LombResult {
+    pub best_frequency: f32,
+    pub best_period_days: f32,
+    pub best_power: f32,
+    pub best_frequency_index: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkResult {
+    #[serde(rename = "workUnitID")]
+    pub work_unit_id: String,
+    #[serde(rename = "nodeID")]
+    pub node_id: String,
+    pub status: ResultStatus,
+    pub duration: f64,
+    pub payload: Option<ResultPayload>,
+    pub error_message: Option<String>,
+    pub failure_kind: Option<FailureKind>,
+    pub best_frequency: Option<f32>,
+    pub best_period_days: Option<f32>,
+    pub best_power: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResultStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultPayload {
+    pub best_frequency: f32,
+    pub best_period_days: f32,
+    pub best_power: f32,
+    pub best_frequency_index: usize,
+    pub cpu_duration_seconds: f64,
+    pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureKind {
+    Execution,
+    WorkloadValidation,
+    InvalidInput,
+    EnvironmentUnavailable,
+    TransportUnavailable,
+    UnsupportedWorkload,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResultReceipt {
+    pub accepted: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl WorkResult {
+    pub fn completed(
+        work_id: &str,
+        node_id: &str,
+        result: LombResult,
+        cpu_duration: f64,
+        total_duration: f64,
+    ) -> Self {
+        let payload = ResultPayload {
+            best_frequency: result.best_frequency,
+            best_period_days: result.best_period_days,
+            best_power: result.best_power,
+            best_frequency_index: result.best_frequency_index,
+            cpu_duration_seconds: cpu_duration,
+            total_workload_duration_seconds: total_duration,
+        };
+        Self {
+            work_unit_id: work_id.into(),
+            node_id: node_id.into(),
+            status: ResultStatus::Completed,
+            duration: total_duration,
+            payload: Some(payload),
+            error_message: None,
+            failure_kind: None,
+            best_frequency: Some(result.best_frequency),
+            best_period_days: Some(result.best_period_days),
+            best_power: Some(result.best_power),
+        }
+    }
+
+    pub fn failed(
+        work_id: &str,
+        node_id: &str,
+        duration: f64,
+        kind: FailureKind,
+        message: String,
+    ) -> Self {
+        Self {
+            work_unit_id: work_id.into(),
+            node_id: node_id.into(),
+            status: ResultStatus::Failed,
+            duration,
+            payload: None,
+            error_message: Some(message),
+            failure_kind: Some(kind),
+            best_frequency: None,
+            best_period_days: None,
+            best_power: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn work(payload: Option<Value>) -> WorkUnit {
-        WorkUnit {
-            id: "w1".into(),
-            project_id: "p1".into(),
-            workload_id: LOMB_SCARGLE_V1.into(),
-            dataset_id: "d1".into(),
-            payload,
-            frequency_start: Some(1.0),
-            frequency_step: Some(0.25),
-            frequency_count: Some(8),
-            frequency_start_index: Some(40),
-        }
-    }
-
     #[test]
-    fn modern_and_legacy_payloads_decode() {
-        let modern = work(Some(serde_json::json!({"frequencyStart":2.0,"frequencyStep":0.5,"frequencyCount":4,"frequencyStartIndex":9}))).lomb_payload().unwrap();
+    fn failure_kinds_are_exactly_hyphenated() {
+        let kinds = [
+            FailureKind::Execution,
+            FailureKind::WorkloadValidation,
+            FailureKind::InvalidInput,
+            FailureKind::EnvironmentUnavailable,
+            FailureKind::TransportUnavailable,
+            FailureKind::UnsupportedWorkload,
+            FailureKind::Unknown,
+        ];
         assert_eq!(
-            (
-                modern.frequency_start,
-                modern.frequency_count,
-                modern.frequency_start_index
-            ),
-            (2.0, 4, 9)
-        );
-        let legacy = work(None).lomb_payload().unwrap();
-        assert_eq!(
-            (
-                legacy.frequency_step,
-                legacy.frequency_count,
-                legacy.frequency_start_index
-            ),
-            (0.25, 8, 40)
+            serde_json::to_value(kinds).unwrap(),
+            serde_json::json!([
+                "execution",
+                "workload-validation",
+                "invalid-input",
+                "environment-unavailable",
+                "transport-unavailable",
+                "unsupported-workload",
+                "unknown"
+            ])
         );
     }
 
     #[test]
-    fn dataset_accepts_flux_values_and_timestamps() {
-        let flux: Dataset =
-            serde_json::from_value(serde_json::json!({"times":[0.0],"flux":[1.0]})).unwrap();
-        let values: Dataset =
-            serde_json::from_value(serde_json::json!({"timestamps":[0.0],"values":[2.0]})).unwrap();
-        assert_eq!(flux.values(), Some(&[1.0][..]));
-        assert_eq!(values.values(), Some(&[2.0][..]));
+    fn generic_dataset_wins_over_legacy() {
+        let d: Dataset = serde_json::from_value(serde_json::json!({
+            "coordinates":[1.0], "values":[2.0], "times":[3.0], "flux":[4.0]
+        }))
+        .unwrap();
+        assert_eq!(d.series(), Some((&[1.0][..], &[2.0][..])));
     }
 
     #[test]
-    fn registration_claim_and_result_shapes() {
-        let registration: RegistrationResponse =
-            serde_json::from_str(r#"{"nodeId":"n1"}"#).unwrap();
-        assert_eq!(registration.node_id, "n1");
-        let claim: ClaimResponse = serde_json::from_str("{}").unwrap();
-        assert!(claim.work().is_none());
-        let body = serde_json::to_vec(&ResultEnvelope {
-            workload_id: LOMB_SCARGLE_V1.into(),
-            result: Some(LombResult {
-                powers: vec![0.5],
-                best_frequency_index: 7,
-            }),
-            failure: None,
-        })
+    fn nested_and_flattened_payloads_use_start_frequency() {
+        let mut w: WorkUnit = serde_json::from_value(serde_json::json!({"id":"w","projectID":"p",
+            "workloadID":LOMB_SCARGLE_V1,"datasetID":"d","startFrequency":0.1,
+            "frequencyStep":0.01,"frequencyCount":3,"frequencyStartIndex":7}))
+        .unwrap();
+        assert_eq!(w.lomb_payload().unwrap().start_frequency, 0.1);
+        w.payload = Some(
+            serde_json::json!({"startFrequency":0.2,"frequencyStep":0.02,
+            "frequencyCount":4,"frequencyStartIndex":8}),
+        );
+        assert_eq!(w.lomb_payload().unwrap().start_frequency, 0.2);
+    }
+
+    #[test]
+    fn completed_result_has_real_envelope_and_flattened_fields() {
+        let value = serde_json::to_value(WorkResult::completed(
+            "work",
+            "node",
+            LombResult {
+                best_frequency: 2.0,
+                best_period_days: 0.5,
+                best_power: 0.9,
+                best_frequency_index: 42,
+            },
+            1.25,
+            1.25,
+        ))
         .unwrap();
         assert_eq!(
-            String::from_utf8(body).unwrap(),
-            r#"{"workloadId":"openstar.lomb-scargle.v1","result":{"powers":[0.5],"bestFrequencyIndex":7}}"#
+            value,
+            serde_json::json!({
+                "workUnitID":"work", "nodeID":"node", "status":"completed", "duration":1.25,
+                "payload":{"bestFrequency":2.0,"bestPeriodDays":0.5,"bestPower":0.9,
+                    "bestFrequencyIndex":42,"cpuDurationSeconds":1.25,"totalWorkloadDurationSeconds":1.25},
+                "errorMessage":null,"failureKind":null,"bestFrequency":2.0,
+                "bestPeriodDays":0.5,"bestPower":0.9
+            })
         );
     }
 }
