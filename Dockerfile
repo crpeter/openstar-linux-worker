@@ -1,0 +1,13 @@
+FROM rust:1.80-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml ./
+COPY src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin openstar \
+ && apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/openstar-linux-worker /usr/local/bin/
+USER openstar
+ENTRYPOINT ["/usr/local/bin/openstar-linux-worker"]
