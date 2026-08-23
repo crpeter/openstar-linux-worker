@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenStar generic Linux CPU worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openstar
+Group=openstar
+EnvironmentFile=/etc/openstar-worker.env
+ExecStart=/usr/local/bin/openstar-linux-worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=openstar-worker
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

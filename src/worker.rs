@@ -1,0 +1,414 @@
+use crate::{
+    client::{Coordinator, RequestError},
+    config::Config,
+    kernel,
+    protocol::*,
+};
+use anyhow::Result;
+use rand::Rng;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::{watch, Semaphore};
+use tracing::{info, warn};
+
+pub struct Worker {
+    config: Config,
+    client: Coordinator,
+    pool: Arc<rayon::ThreadPool>,
+    node_id: String,
+}
+
+impl Worker {
+    pub fn new(config: Config) -> Result<Self> {
+        config.validate()?;
+        let node_id = config.node_identity()?.to_string();
+        let threads = config.cpu_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        });
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        let client = Coordinator::new(config.coordinator_url.clone(), config.timeout())?;
+        Ok(Self {
+            config,
+            client,
+            pool: Arc::new(pool),
+            node_id,
+        })
+    }
+
+    pub async fn run(self, mut stop: watch::Receiver<bool>) -> Result<()> {
+        let processor_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let receipt = self
+            .client
+            .register(&Registration {
+                node_id: &self.node_id,
+                capabilities: Capabilities {
+                    platform: "linux",
+                    hardware_identifier: format!("{} Linux CPU", std::env::consts::ARCH),
+                    gpu_name: "none",
+                    processor_count,
+                    memory_gb: memory_gb(),
+                    compute_backends: vec![Backend { id: "cpu" }],
+                    workloads: vec![WorkloadCapability {
+                        workload_id: LOMB_SCARGLE_V1,
+                        execution_backends: vec![Backend { id: "cpu" }],
+                        validator_id: None,
+                    }],
+                },
+            })
+            .await?;
+        anyhow::ensure!(
+            receipt.accepted,
+            "registration rejected: {}",
+            receipt.message
+        );
+        info!(node_id=%self.node_id, message=%receipt.message, "registered");
+
+        let permits = Arc::new(Semaphore::new(self.config.work_concurrency));
+        let mut backoff = self.config.poll_interval_ms;
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            let permit = tokio::select! {
+                permit = permits.clone().acquire_owned() => permit?,
+                changed = stop.changed() => { changed?; break; }
+            };
+            match self.client.claim(&self.node_id).await {
+                Ok(Some(work)) => {
+                    backoff = self.config.poll_interval_ms;
+                    let (client, pool, node_id) =
+                        (self.client.clone(), self.pool.clone(), self.node_id.clone());
+                    let max = self.config.max_backoff_ms;
+                    drop(tokio::spawn(async move {
+                        let _permit = permit;
+                        process(client, pool, node_id, work, max).await;
+                    }));
+                }
+                Ok(None) => {
+                    drop(permit);
+                    sleep_or_stop(
+                        Duration::from_millis(self.config.poll_interval_ms),
+                        &mut stop,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    drop(permit);
+                    warn!(%error, "claim failed");
+                    let jitter = rand::thread_rng().gen_range(0..=(backoff / 4));
+                    sleep_or_stop(Duration::from_millis(backoff + jitter), &mut stop).await;
+                    backoff = backoff.saturating_mul(2).min(self.config.max_backoff_ms);
+                }
+            }
+        }
+        let count = u32::try_from(self.config.work_concurrency)?;
+        let _drain = permits.acquire_many(count).await?;
+        Ok(())
+    }
+}
+
+fn memory_gb() -> f32 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("MemTotal:"))
+                .and_then(|line| line.split_whitespace().nth(1))?
+                .parse::<f32>()
+                .ok()
+        })
+        .map(|kib| kib / 1024.0 / 1024.0)
+        .unwrap_or(0.0)
+}
+
+async fn sleep_or_stop(duration: Duration, stop: &mut watch::Receiver<bool>) {
+    tokio::select! { _ = tokio::time::sleep(duration) => {}, _ = stop.changed() => {} }
+}
+
+async fn process(
+    client: Coordinator,
+    pool: Arc<rayon::ThreadPool>,
+    node_id: String,
+    work: WorkUnit,
+    max_backoff: u64,
+) {
+    let started = Instant::now();
+    let result = if work.workload_id != LOMB_SCARGLE_V1 {
+        WorkResult::failed(
+            &work.id,
+            &node_id,
+            started.elapsed().as_secs_f64(),
+            FailureKind::UnsupportedWorkload,
+            format!("unsupported workload: {}", work.workload_id),
+        )
+    } else {
+        match fetch_with_retry(&client, &work, max_backoff).await {
+            Ok(dataset) => match work.lomb_payload() {
+                Err(message) => WorkResult::failed(
+                    &work.id,
+                    &node_id,
+                    started.elapsed().as_secs_f64(),
+                    FailureKind::InvalidInput,
+                    message,
+                ),
+                Ok(payload) => {
+                    let computation = tokio::task::spawn_blocking(move || {
+                        let cpu_started = Instant::now();
+                        let output = pool.install(|| kernel::execute(&dataset, &payload));
+                        (output, cpu_started.elapsed().as_secs_f64())
+                    })
+                    .await;
+                    match computation {
+                        Ok((Ok(output), cpu_duration)) => WorkResult::completed(
+                            &work.id,
+                            &node_id,
+                            output,
+                            cpu_duration,
+                            started.elapsed().as_secs_f64(),
+                        ),
+                        Ok((Err(error), _)) => WorkResult::failed(
+                            &work.id,
+                            &node_id,
+                            started.elapsed().as_secs_f64(),
+                            FailureKind::InvalidInput,
+                            error.to_string(),
+                        ),
+                        Err(error) => WorkResult::failed(
+                            &work.id,
+                            &node_id,
+                            started.elapsed().as_secs_f64(),
+                            FailureKind::Execution,
+                            error.to_string(),
+                        ),
+                    }
+                }
+            },
+            Err(error) => {
+                let kind = if matches!(
+                    &error,
+                    RequestError::InvalidResponse(_) | RequestError::Permanent(_)
+                ) {
+                    FailureKind::InvalidInput
+                } else {
+                    FailureKind::TransportUnavailable
+                };
+                WorkResult::failed(
+                    &work.id,
+                    &node_id,
+                    started.elapsed().as_secs_f64(),
+                    kind,
+                    error.to_string(),
+                )
+            }
+        }
+    };
+    let body = serde_json::to_vec(&result).expect("work result is serializable");
+    submit_with_retry(&client, &work.id, &body, max_backoff).await;
+}
+
+async fn fetch_with_retry(
+    client: &Coordinator,
+    work: &WorkUnit,
+    max: u64,
+) -> Result<Dataset, RequestError> {
+    let mut delay = 250;
+    for attempt in 0..5 {
+        match client.dataset(work).await {
+            Ok(dataset) => return Ok(dataset),
+            Err(error) if error.transient() && attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(max);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+async fn submit_with_retry(client: &Coordinator, work_id: &str, body: &[u8], max: u64) {
+    let mut delay = 500;
+    loop {
+        match client.submit_bytes(work_id, body).await {
+            Ok(receipt) => {
+                info!(accepted=receipt.accepted, message=?receipt.message, "result receipt");
+                break;
+            }
+            Err(error) if error.transient() => {
+                warn!(%error, "result submission failed; retrying");
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(max.max(500));
+            }
+            Err(error) => {
+                warn!(%error, "permanent result submission failure");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::{Method::POST, MockServer};
+    use url::Url;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn transient_submission_reuses_identical_bytes() {
+        let server = MockServer::start_async().await;
+        let body = String::from(r#"{"stable":"body"}"#);
+        let bytes = body.as_bytes().to_vec();
+        let first = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/w/result")
+                    .header("content-type", "application/json")
+                    .body(body.clone());
+                then.status(503);
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let task = tokio::spawn({
+            let client = client.clone();
+            let bytes = bytes.clone();
+            async move {
+                submit_with_retry(&client, "w", &bytes, 500).await;
+            }
+        });
+        while first.hits_async().await == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        first.delete_async().await;
+        let second = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/w/result")
+                    .header("content-type", "application/json")
+                    .body(body.clone());
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        task.await.unwrap();
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_conflict_is_not_retried() {
+        let server = MockServer::start_async().await;
+        let conflict = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/work/w/result");
+                then.status(409);
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            submit_with_retry(&client, "w", b"{}", 500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict.hits_async().await, 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_workload_reports_failure_without_dataset_fetch() {
+        let server = MockServer::start_async().await;
+        let submission = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/w/result")
+                    .body_contains(r#""failureKind":"unsupported-workload""#)
+                    .body_contains(r#""errorMessage":"unsupported workload: other""#);
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let work = WorkUnit {
+            id: "w".into(),
+            project_id: "p".into(),
+            workload_id: "other".into(),
+            dataset_id: "d".into(),
+            payload: None,
+            start_frequency: None,
+            frequency_step: None,
+            frequency_count: None,
+            frequency_start_index: None,
+        };
+        process(client, pool, "n".into(), work, 1).await;
+        submission.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_active_result_submission() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/nodes/register");
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted":true,"message":"ok"}));
+            })
+            .await;
+        server.mock_async(|when, then| { when.method(POST).path("/v1/work/claim");
+            then.status(200).json_body(serde_json::json!({"id":"w","projectID":"p","workloadID":LOMB_SCARGLE_V1,
+                "datasetID":"d","payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}})); }).await;
+        let dataset = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d");
+            then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
+        let result = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/work/w/result");
+                then.delay(Duration::from_millis(100))
+                    .status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let config = Config {
+            coordinator_url: Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            node_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()),
+            state_dir: std::env::temp_dir(),
+            work_concurrency: 1,
+            cpu_threads: Some(1),
+            poll_interval_ms: 10,
+            max_backoff_ms: 100,
+            request_timeout_secs: 2,
+            log_level: "info".into(),
+        };
+        let worker = Worker::new(config).unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(worker.run(stop_rx));
+        while dataset.hits_async().await == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        result.assert_async().await;
+    }
+}
