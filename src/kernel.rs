@@ -75,7 +75,7 @@ pub(crate) fn select_winner(p: &LombPayload, powers: &[f32]) -> Result<LombResul
     let (winner, &best_power) = powers
         .iter()
         .enumerate()
-        .try_fold(None, |best, candidate| {
+        .try_fold(None::<(usize, &f32)>, |best, candidate| {
             if !candidate.1.is_finite() {
                 return Err(ComputeError::InvalidResult);
             }

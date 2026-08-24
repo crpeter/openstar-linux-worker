@@ -3,11 +3,11 @@ use crate::{
     kernel::{self, ComputeError},
     protocol::{Dataset, LombPayload, LombResult},
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use ash::{vk, Entry};
 use std::{
     ffi::{CStr, CString},
-    mem::size_of,
+    mem::size_of_val,
     ptr,
     sync::Mutex,
 };
@@ -205,7 +205,7 @@ impl Context {
         })
     }
     unsafe fn write<T: Copy>(&self, b: &Buffer, values: &[T]) -> Result<()> {
-        let bytes = size_of::<T>() * values.len();
+        let bytes = size_of_val(values);
         let mapped = unsafe {
             self.device
                 .map_memory(b.memory, 0, b.size, vk::MemoryMapFlags::empty())?

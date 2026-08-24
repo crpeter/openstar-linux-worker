@@ -284,7 +284,8 @@ mod tests {
     fn backend_runtime_failure_is_not_invalid_input() {
         let error = crate::backend::BackendError::Execution(anyhow::anyhow!("device lost"));
         assert_eq!(backend_failure_kind(&error), FailureKind::Execution);
-        let error = crate::backend::BackendError::InvalidInput(kernel::ComputeError::InvalidCount);
+        let error =
+            crate::backend::BackendError::InvalidInput(crate::kernel::ComputeError::InvalidCount);
         assert_eq!(backend_failure_kind(&error), FailureKind::InvalidInput);
     }
 
