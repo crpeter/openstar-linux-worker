@@ -327,7 +327,12 @@ impl Context {
             }
         };
         let powers = run().map_err(BackendError::Execution)?;
-        kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)
+        let gpu_winner = kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)?;
+        let chunk_winner = gpu_winner
+            .best_frequency_index
+            .checked_sub(p.frequency_start_index)
+            .ok_or(ComputeError::InvalidResult)?;
+        kernel::refine_winner(dataset, p, chunk_winner).map_err(BackendError::InvalidInput)
     }
 }
 impl ComputeBackend for VulkanBackend {
