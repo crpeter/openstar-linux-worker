@@ -8,9 +8,20 @@ use clap::ValueEnum;
 use std::{fmt, sync::Arc};
 use tracing::{info, warn};
 
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    #[error(transparent)]
+    InvalidInput(#[from] ComputeError),
+    #[error("compute backend execution failed: {0:#}")]
+    Execution(#[source] anyhow::Error),
+}
+
 pub trait ComputeBackend: Send + Sync {
-    fn execute(&self, dataset: &Dataset, payload: &LombPayload)
-        -> Result<LombResult, ComputeError>;
+    fn execute(
+        &self,
+        dataset: &Dataset,
+        payload: &LombPayload,
+    ) -> std::result::Result<LombResult, BackendError>;
     fn id(&self) -> &'static str;
     fn gpu_name(&self) -> Option<&str> {
         None
@@ -34,8 +45,10 @@ impl ComputeBackend for CpuBackend {
         &self,
         dataset: &Dataset,
         payload: &LombPayload,
-    ) -> Result<LombResult, ComputeError> {
-        self.pool.install(|| kernel::execute(dataset, payload))
+    ) -> std::result::Result<LombResult, BackendError> {
+        self.pool
+            .install(|| kernel::execute(dataset, payload))
+            .map_err(BackendError::InvalidInput)
     }
     fn id(&self) -> &'static str {
         "cpu"

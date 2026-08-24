@@ -50,6 +50,13 @@ devices must expose a queue with both `GRAPHICS` and `COMPUTE`; a compute-only q
 is deliberately never selected (including when it appears to be dedicated), to avoid
 the known AMD Liverpool dedicated-compute-ring hang. GPU frequency powers are copied
 back and the host applies the CPU kernel's lowest-index exact-tie rule.
+The shader follows the CPU kernel's Float32 formulas and accumulation order, but
+GPU implementations of `sin`, `cos`, and `atan` can differ slightly from the host
+math library. Host-side selection is deterministic for the powers returned by the
+GPU; CPU/Vulkan power values are therefore compared with a numerical tolerance.
+For wire compatibility, `cpuDurationSeconds` remains present for CPU results only;
+Vulkan results use the existing backend-neutral total workload duration fields and
+do not label Vulkan execution time as CPU (or Metal) time.
 The service's `StateDirectory` gives its unprivileged user write access to the
 identity directory. Back up `node-id` to preserve coordinator identity when moving
 the worker to a new host, or configure `OPENSTAR_NODE_ID` explicitly.

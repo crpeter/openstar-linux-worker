@@ -215,7 +215,10 @@ mod tests {
             &work.id,
             registration.node_id,
             result,
-            1.25,
+            ExecutionDuration {
+                backend: "cpu",
+                seconds: 1.25,
+            },
             1.25,
         ))
         .unwrap();

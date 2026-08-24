@@ -1,5 +1,5 @@
 use crate::{
-    backend::ComputeBackend,
+    backend::{BackendError, ComputeBackend},
     kernel::{self, ComputeError},
     protocol::{Dataset, LombPayload, LombResult},
 };
@@ -227,10 +227,14 @@ impl Context {
         }
         Ok(result)
     }
-    fn execute(&mut self, dataset: &Dataset, p: &LombPayload) -> Result<LombResult, ComputeError> {
+    fn execute(
+        &mut self,
+        dataset: &Dataset,
+        p: &LombPayload,
+    ) -> std::result::Result<LombResult, BackendError> {
         let (x, y, normalization) = kernel::validate(dataset, p)?;
         if u32::try_from(x.len()).is_err() || u32::try_from(p.frequency_count).is_err() {
-            return Err(ComputeError::InvalidCount);
+            return Err(ComputeError::InvalidCount.into());
         }
         let run = || -> Result<Vec<f32>> {
             unsafe {
@@ -322,15 +326,19 @@ impl Context {
                 Ok(result)
             }
         };
-        let powers = run().map_err(|_| ComputeError::InvalidResult)?;
-        kernel::select_winner(p, &powers)
+        let powers = run().map_err(BackendError::Execution)?;
+        kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)
     }
 }
 impl ComputeBackend for VulkanBackend {
-    fn execute(&self, d: &Dataset, p: &LombPayload) -> Result<LombResult, ComputeError> {
+    fn execute(
+        &self,
+        d: &Dataset,
+        p: &LombPayload,
+    ) -> std::result::Result<LombResult, BackendError> {
         self.inner
             .lock()
-            .expect("Vulkan mutex poisoned")
+            .map_err(|_| BackendError::Execution(anyhow!("Vulkan context mutex poisoned")))?
             .execute(d, p)
     }
     fn id(&self) -> &'static str {

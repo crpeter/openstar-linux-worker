@@ -4,7 +4,8 @@ fn main() {
     let compiler = shaderc::Compiler::new().unwrap();
     let mut options = shaderc::CompileOptions::new().unwrap();
     options.set_target_env(shaderc::TargetEnv::Vulkan, 0);
-    // Keep the source operation order; the CPU kernel's Float32 equations are authoritative.
+    // Keep the Float32 source operation order. GPU transcendental implementations
+    // may nevertheless differ slightly from the host math library.
     options.set_optimization_level(shaderc::OptimizationLevel::Zero);
     let artifact = compiler
         .compile_into_spirv(

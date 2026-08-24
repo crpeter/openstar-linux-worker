@@ -165,6 +165,7 @@ async fn process(
                     message,
                 ),
                 Ok(payload) => {
+                    let backend_id = backend.id();
                     let computation = tokio::task::spawn_blocking(move || {
                         let execution_started = Instant::now();
                         let output = backend.execute(&dataset, &payload);
@@ -176,16 +177,22 @@ async fn process(
                             &work.id,
                             &node_id,
                             output,
-                            execution_duration,
+                            ExecutionDuration {
+                                backend: backend_id,
+                                seconds: execution_duration,
+                            },
                             started.elapsed().as_secs_f64(),
                         ),
-                        Ok((Err(error), _)) => WorkResult::failed(
-                            &work.id,
-                            &node_id,
-                            started.elapsed().as_secs_f64(),
-                            FailureKind::InvalidInput,
-                            error.to_string(),
-                        ),
+                        Ok((Err(error), _)) => {
+                            let kind = backend_failure_kind(&error);
+                            WorkResult::failed(
+                                &work.id,
+                                &node_id,
+                                started.elapsed().as_secs_f64(),
+                                kind,
+                                error.to_string(),
+                            )
+                        }
                         Err(error) => WorkResult::failed(
                             &work.id,
                             &node_id,
@@ -217,6 +224,13 @@ async fn process(
     };
     let body = serde_json::to_vec(&result).expect("work result is serializable");
     submit_with_retry(&client, &work.id, &body, max_backoff).await;
+}
+
+fn backend_failure_kind(error: &crate::backend::BackendError) -> FailureKind {
+    match error {
+        crate::backend::BackendError::InvalidInput(_) => FailureKind::InvalidInput,
+        crate::backend::BackendError::Execution(_) => FailureKind::Execution,
+    }
 }
 
 async fn fetch_with_retry(
@@ -265,6 +279,14 @@ mod tests {
     use httpmock::{Method::POST, MockServer};
     use url::Url;
     use uuid::Uuid;
+
+    #[test]
+    fn backend_runtime_failure_is_not_invalid_input() {
+        let error = crate::backend::BackendError::Execution(anyhow::anyhow!("device lost"));
+        assert_eq!(backend_failure_kind(&error), FailureKind::Execution);
+        let error = crate::backend::BackendError::InvalidInput(kernel::ComputeError::InvalidCount);
+        assert_eq!(backend_failure_kind(&error), FailureKind::InvalidInput);
+    }
 
     #[tokio::test]
     async fn transient_submission_reuses_identical_bytes() {

@@ -158,8 +158,17 @@ pub struct ResultPayload {
     pub best_period_days: f32,
     pub best_power: f32,
     pub best_frequency_index: usize,
-    pub cpu_duration_seconds: f64,
+    // This legacy wire field is emitted only for CPU execution. The existing
+    // top-level and total-workload durations remain backend-neutral.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_duration_seconds: Option<f64>,
     pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutionDuration {
+    pub backend: &'static str,
+    pub seconds: f64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -186,7 +195,7 @@ impl WorkResult {
         work_id: &str,
         node_id: &str,
         result: LombResult,
-        cpu_duration: f64,
+        execution_duration: ExecutionDuration,
         total_duration: f64,
     ) -> Self {
         let payload = ResultPayload {
@@ -194,7 +203,8 @@ impl WorkResult {
             best_period_days: result.best_period_days,
             best_power: result.best_power,
             best_frequency_index: result.best_frequency_index,
-            cpu_duration_seconds: cpu_duration,
+            cpu_duration_seconds: (execution_duration.backend == "cpu")
+                .then_some(execution_duration.seconds),
             total_workload_duration_seconds: total_duration,
         };
         Self {
@@ -296,7 +306,10 @@ mod tests {
                 best_power: 0.875,
                 best_frequency_index: 42,
             },
-            1.25,
+            ExecutionDuration {
+                backend: "cpu",
+                seconds: 1.25,
+            },
             1.25,
         ))
         .unwrap();
@@ -310,5 +323,29 @@ mod tests {
                 "bestPeriodDays":0.5,"bestPower":0.875
             })
         );
+    }
+
+    #[test]
+    fn vulkan_duration_is_not_labeled_as_cpu_time() {
+        let value = serde_json::to_value(WorkResult::completed(
+            "work",
+            "node",
+            LombResult {
+                best_frequency: 2.0,
+                best_period_days: 0.5,
+                best_power: 0.875,
+                best_frequency_index: 42,
+            },
+            ExecutionDuration {
+                backend: "vulkan",
+                seconds: 0.25,
+            },
+            0.5,
+        ))
+        .unwrap();
+        let payload = value["payload"].as_object().unwrap();
+        assert!(!payload.contains_key("cpuDurationSeconds"));
+        assert_eq!(payload["totalWorkloadDurationSeconds"], 0.5);
+        assert_eq!(value["duration"], 0.5);
     }
 }
