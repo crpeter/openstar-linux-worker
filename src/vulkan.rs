@@ -224,42 +224,55 @@ impl Context {
                 None,
             )
         }?;
-        let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let props = unsafe {
-            self.instance
-                .get_physical_device_memory_properties(self.physical)
-        };
-        let memory_type_index = (0..props.memory_type_count)
-            .find(|&i| {
-                req.memory_type_bits & (1 << i) != 0
-                    && props.memory_types[i as usize].property_flags.contains(
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )
+        let mut allocated_memory = None;
+        let result = (|| -> Result<Buffer> {
+            let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_memory_properties(self.physical)
+            };
+            let memory_type_index = (0..props.memory_type_count)
+                .find(|&i| {
+                    req.memory_type_bits & (1 << i) != 0
+                        && props.memory_types[i as usize].property_flags.contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                })
+                .ok_or_else(|| anyhow!("no host-visible coherent Vulkan memory"))?;
+            let memory = unsafe {
+                self.device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(memory_type_index),
+                    None,
+                )
+            }?;
+            allocated_memory = Some(memory);
+            unsafe {
+                self.device.bind_buffer_memory(buffer, memory, 0)?;
+            }
+            let mapped = unsafe {
+                self.device
+                    .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?
+                    .cast()
+            };
+            Ok(Buffer {
+                buffer,
+                memory,
+                size,
+                mapped,
             })
-            .ok_or_else(|| anyhow!("no host-visible coherent Vulkan memory"))?;
-        let memory = unsafe {
-            self.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(memory_type_index),
-                None,
-            )
-        }?;
-        unsafe {
-            self.device.bind_buffer_memory(buffer, memory, 0)?;
+        })();
+        if result.is_err() {
+            unsafe {
+                if let Some(memory) = allocated_memory {
+                    self.device.free_memory(memory, None);
+                }
+                self.device.destroy_buffer(buffer, None);
+            }
         }
-        let mapped = unsafe {
-            self.device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?
-                .cast()
-        };
-        Ok(Buffer {
-            buffer,
-            memory,
-            size,
-            mapped,
-        })
+        result
     }
     unsafe fn write<T: Copy>(b: &Buffer, values: &[T]) {
         let bytes = size_of_val(values);
@@ -293,25 +306,51 @@ impl Context {
                     .pool_sizes(&pool_sizes),
                 None,
             )?;
-            let descriptor_set = self.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[self.descriptor_layout]),
-            )?[0];
-            let command_buffer = self.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.command_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )?[0];
-            Ok(ExecutionResources {
-                x: self.buffer(x_size)?,
-                y: self.buffer(y_size)?,
-                output: self.buffer(output_size)?,
-                descriptor_pool,
-                descriptor_set,
-                command_buffer,
-            })
+            let mut command_buffer = None;
+            let mut x = None;
+            let mut y = None;
+            let result = (|| -> Result<ExecutionResources> {
+                let descriptor_set = self.device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&[self.descriptor_layout]),
+                )?[0];
+                command_buffer = Some(
+                    self.device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(self.command_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )?[0],
+                );
+                x = Some(self.buffer(x_size)?);
+                y = Some(self.buffer(y_size)?);
+                let output = self.buffer(output_size)?;
+                Ok(ExecutionResources {
+                    x: x.take().expect("x buffer was just created"),
+                    y: y.take().expect("y buffer was just created"),
+                    output,
+                    descriptor_pool,
+                    descriptor_set,
+                    command_buffer: command_buffer
+                        .take()
+                        .expect("command buffer was just allocated"),
+                })
+            })();
+            if result.is_err() {
+                if let Some(buffer) = y {
+                    self.destroy_buffer(buffer);
+                }
+                if let Some(buffer) = x {
+                    self.destroy_buffer(buffer);
+                }
+                if let Some(command_buffer) = command_buffer {
+                    self.device
+                        .free_command_buffers(self.command_pool, &[command_buffer]);
+                }
+                self.device.destroy_descriptor_pool(descriptor_pool, None);
+            }
+            result
         }
     }
 
