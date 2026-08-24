@@ -16,7 +16,7 @@ pub struct Registration<'a> {
 pub struct Capabilities {
     pub platform: &'static str,
     pub hardware_identifier: String,
-    pub gpu_name: &'static str,
+    pub gpu_name: String,
     pub processor_count: usize,
     #[serde(rename = "memoryGB")]
     pub memory_gb: f32,

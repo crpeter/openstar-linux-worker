@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+ash = "0.38"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 rayon = "1.10"
@@ -19,6 +20,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+shaderc = "0.8"
 
 [dev-dependencies]
 httpmock = "0.7"

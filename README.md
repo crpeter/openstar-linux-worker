@@ -1,12 +1,14 @@
 # OpenStar Linux worker
 
-A headless, generic CPU compute worker. It registers with an OpenStar coordinator,
+A headless, generic CPU/Vulkan compute worker. It registers with an OpenStar coordinator,
 claims opaque work, downloads its referenced dataset, and currently dispatches only
 `openstar.lomb-scargle.v1`. It contains no dataset discovery or science orchestration.
 
 The wire models follow the verified `openstarserver/main` contract and the CPU
 kernel follows the Float32 scalar semantics of the validator in `OpenStar/main`.
-Registration supplies a persistent node UUID and advertises only the CPU backend.
+Registration supplies a persistent node UUID and advertises the backend actually selected.
+Vulkan is optional; normal installations need only a Vulkan loader and driver because
+the GLSL compute shader is compiled to SPIR-V by `shaderc` at build time and embedded.
 
 ## Build and test
 
@@ -35,13 +37,19 @@ path prefix. CLI flags correspond to the environment keys below; see `--help`.
 | `OPENSTAR_STATE_DIR` | `/var/lib/openstar-worker` | Stores generated node identity |
 | `OPENSTAR_WORK_CONCURRENCY` | `1` | Simultaneously claimed units |
 | `OPENSTAR_CPU_THREADS` | host parallelism | Rayon CPU threads |
+| `OPENSTAR_COMPUTE_BACKEND` | `auto` | `auto`, `cpu`, or `vulkan` |
 | `OPENSTAR_POLL_INTERVAL_MS` | `2000` | Delay after no work |
 | `OPENSTAR_MAX_BACKOFF_MS` | `30000` | Retry delay ceiling |
 | `OPENSTAR_REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout |
 | `OPENSTAR_LOG` | `info` | tracing filter |
 
 SIGINT/SIGTERM stops claiming; active units finish result submission before exit.
-The worker advertises CPU threads and the one workload only—no GPU capability.
+`auto` selects a discrete or integrated Vulkan GPU when possible and otherwise logs
+a warning and falls back to CPU. `vulkan` makes initialization failure fatal. Vulkan
+devices must expose a queue with both `GRAPHICS` and `COMPUTE`; a compute-only queue
+is deliberately never selected (including when it appears to be dedicated), to avoid
+the known AMD Liverpool dedicated-compute-ring hang. GPU frequency powers are copied
+back and the host applies the CPU kernel's lowest-index exact-tie rule.
 The service's `StateDirectory` gives its unprivileged user write access to the
 identity directory. Back up `node-id` to preserve coordinator identity when moving
 the worker to a new host, or configure `OPENSTAR_NODE_ID` explicitly.

@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Coordinates { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Values { float y[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Powers { float powers[]; };
+layout(push_constant) uniform Parameters {
+    uint sample_count;
+    uint frequency_count;
+    float start_frequency;
+    float frequency_step;
+    float normalization;
+} p;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.frequency_count) return;
+    float frequency = p.start_frequency + float(index) * p.frequency_step;
+    float omega = 2.0 * 3.1415927410125732421875 * frequency;
+    float sum_sin_2wt = 0.0;
+    float sum_cos_2wt = 0.0;
+    for (uint i = 0; i < p.sample_count; ++i) {
+        sum_sin_2wt += sin(2.0 * omega * x[i]);
+        sum_cos_2wt += cos(2.0 * omega * x[i]);
+    }
+    float tau = atan(sum_sin_2wt, sum_cos_2wt) / (2.0 * omega);
+    float sum_y_cos = 0.0, sum_y_sin = 0.0;
+    float sum_cos_squared = 0.0, sum_sin_squared = 0.0;
+    for (uint i = 0; i < p.sample_count; ++i) {
+        float shifted = omega * (x[i] - tau);
+        float cosine = cos(shifted);
+        float sine = sin(shifted);
+        sum_y_cos += y[i] * cosine;
+        sum_y_sin += y[i] * sine;
+        sum_cos_squared += cosine * cosine;
+        sum_sin_squared += sine * sine;
+    }
+    powers[index] = ((sum_y_cos * sum_y_cos / sum_cos_squared) +
+                     (sum_y_sin * sum_y_sin / sum_sin_squared)) / p.normalization;
+}

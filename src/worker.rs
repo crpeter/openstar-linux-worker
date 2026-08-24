@@ -1,7 +1,7 @@
 use crate::{
+    backend::{self, ComputeBackend},
     client::{Coordinator, RequestError},
     config::Config,
-    kernel,
     protocol::*,
 };
 use anyhow::Result;
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 pub struct Worker {
     config: Config,
     client: Coordinator,
-    pool: Arc<rayon::ThreadPool>,
+    backend: Arc<dyn ComputeBackend>,
     node_id: String,
 }
 
@@ -29,14 +29,12 @@ impl Worker {
                 .map(usize::from)
                 .unwrap_or(1)
         });
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
+        let backend = backend::initialize(config.compute_backend, threads)?;
         let client = Coordinator::new(config.coordinator_url.clone(), config.timeout())?;
         Ok(Self {
             config,
             client,
-            pool: Arc::new(pool),
+            backend,
             node_id,
         })
     }
@@ -52,13 +50,17 @@ impl Worker {
                 capabilities: Capabilities {
                     platform: "linux",
                     hardware_identifier: format!("{} Linux CPU", std::env::consts::ARCH),
-                    gpu_name: "none",
+                    gpu_name: self.backend.gpu_name().unwrap_or("none").to_owned(),
                     processor_count,
                     memory_gb: memory_gb(),
-                    compute_backends: vec![Backend { id: "cpu" }],
+                    compute_backends: vec![Backend {
+                        id: self.backend.id(),
+                    }],
                     workloads: vec![WorkloadCapability {
                         workload_id: LOMB_SCARGLE_V1,
-                        execution_backends: vec![Backend { id: "cpu" }],
+                        execution_backends: vec![Backend {
+                            id: self.backend.id(),
+                        }],
                         validator_id: None,
                     }],
                 },
@@ -84,12 +86,15 @@ impl Worker {
             match self.client.claim(&self.node_id).await {
                 Ok(Some(work)) => {
                     backoff = self.config.poll_interval_ms;
-                    let (client, pool, node_id) =
-                        (self.client.clone(), self.pool.clone(), self.node_id.clone());
+                    let (client, backend, node_id) = (
+                        self.client.clone(),
+                        self.backend.clone(),
+                        self.node_id.clone(),
+                    );
                     let max = self.config.max_backoff_ms;
                     drop(tokio::spawn(async move {
                         let _permit = permit;
-                        process(client, pool, node_id, work, max).await;
+                        process(client, backend, node_id, work, max).await;
                     }));
                 }
                 Ok(None) => {
@@ -135,7 +140,7 @@ async fn sleep_or_stop(duration: Duration, stop: &mut watch::Receiver<bool>) {
 
 async fn process(
     client: Coordinator,
-    pool: Arc<rayon::ThreadPool>,
+    backend: Arc<dyn ComputeBackend>,
     node_id: String,
     work: WorkUnit,
     max_backoff: u64,
@@ -161,17 +166,17 @@ async fn process(
                 ),
                 Ok(payload) => {
                     let computation = tokio::task::spawn_blocking(move || {
-                        let cpu_started = Instant::now();
-                        let output = pool.install(|| kernel::execute(&dataset, &payload));
-                        (output, cpu_started.elapsed().as_secs_f64())
+                        let execution_started = Instant::now();
+                        let output = backend.execute(&dataset, &payload);
+                        (output, execution_started.elapsed().as_secs_f64())
                     })
                     .await;
                     match computation {
-                        Ok((Ok(output), cpu_duration)) => WorkResult::completed(
+                        Ok((Ok(output), execution_duration)) => WorkResult::completed(
                             &work.id,
                             &node_id,
                             output,
-                            cpu_duration,
+                            execution_duration,
                             started.elapsed().as_secs_f64(),
                         ),
                         Ok((Err(error), _)) => WorkResult::failed(
@@ -346,12 +351,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .unwrap(),
-        );
+        let backend = backend::initialize(crate::backend::BackendChoice::Cpu, 1).unwrap();
         let work = WorkUnit {
             id: "w".into(),
             project_id: "p".into(),
@@ -363,7 +363,7 @@ mod tests {
             frequency_count: None,
             frequency_start_index: None,
         };
-        process(client, pool, "n".into(), work, 1).await;
+        process(client, backend, "n".into(), work, 1).await;
         submission.assert_async().await;
     }
 
@@ -396,6 +396,7 @@ mod tests {
             state_dir: std::env::temp_dir(),
             work_concurrency: 1,
             cpu_threads: Some(1),
+            compute_backend: crate::backend::BackendChoice::Cpu,
             poll_interval_ms: 10,
             max_backoff_ms: 100,
             request_timeout_secs: 2,
