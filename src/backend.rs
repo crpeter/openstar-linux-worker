@@ -67,9 +67,9 @@ pub fn initialize(choice: BackendChoice, threads: usize) -> Result<Arc<dyn Compu
     match choice {
         BackendChoice::Cpu => selected(Arc::new(CpuBackend::new(threads)?)),
         BackendChoice::Vulkan => selected(Arc::new(
-            VulkanBackend::new().context("Vulkan backend initialization failed")?,
+            VulkanBackend::new(threads).context("Vulkan backend initialization failed")?,
         )),
-        BackendChoice::Auto => match VulkanBackend::new() {
+        BackendChoice::Auto => match VulkanBackend::new(threads) {
             Ok(vulkan) => selected(Arc::new(vulkan)),
             Err(error) => {
                 warn!(%error, "Vulkan unavailable; falling back to CPU");
@@ -122,5 +122,27 @@ mod tests {
     #[test]
     fn explicit_cpu_never_requires_vulkan() {
         assert_eq!(initialize(BackendChoice::Cpu, 1).unwrap().id(), "cpu");
+    }
+
+    #[test]
+    fn configured_cpu_backend_result_is_unchanged() {
+        let dataset = Dataset {
+            coordinates: Some(vec![0.0, 0.37, 1.11, 1.8, 2.73]),
+            values: Some(vec![2.0, 3.2, 1.4, 2.8, 1.9]),
+            times: None,
+            flux: None,
+        };
+        let payload = LombPayload {
+            start_frequency: 0.2,
+            frequency_step: 0.15,
+            frequency_count: 5,
+            frequency_start_index: 40,
+        };
+        let expected = kernel::execute(&dataset, &payload).unwrap();
+        let actual = CpuBackend::new(2)
+            .unwrap()
+            .execute(&dataset, &payload)
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 }
