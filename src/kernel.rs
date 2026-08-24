@@ -2,7 +2,7 @@ use crate::protocol::{Dataset, LombPayload, LombResult};
 use rayon::prelude::*;
 use thiserror::Error;
 
-pub(crate) const VULKAN_CPU_REFINE_RADIUS_BINS: usize = 16;
+pub(crate) const VULKAN_CPU_REFINE_RADIUS_BINS: usize = 128;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ComputeError {
@@ -382,19 +382,41 @@ mod tests {
     #[test]
     fn refinement_window_clamps_at_both_chunk_boundaries() {
         assert_eq!(
-            refinement_range(100, 0).unwrap().collect::<Vec<_>>(),
-            (0..=16).collect::<Vec<_>>()
+            refinement_range(4096, 0).unwrap().collect::<Vec<_>>(),
+            (0..=128).collect::<Vec<_>>()
         );
         assert_eq!(
-            refinement_range(100, 99).unwrap().collect::<Vec<_>>(),
-            (83..=99).collect::<Vec<_>>()
+            refinement_range(4096, 4095).unwrap().collect::<Vec<_>>(),
+            (3967..=4095).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn refinement_uses_at_most_thirty_three_bins() {
-        let range = refinement_range(100, 50).unwrap();
-        assert_eq!(range.count(), 33);
+    fn interior_refinement_uses_at_most_two_hundred_fifty_seven_bins() {
+        let range = refinement_range(4096, 2048).unwrap();
+        assert_eq!(range.count(), 257);
+    }
+
+    #[test]
+    fn cpu_refinement_recovers_a_winner_more_than_sixteen_bins_away() {
+        let payload = LombPayload {
+            start_frequency: 0.1,
+            frequency_step: 0.005,
+            frequency_count: 300,
+            frequency_start_index: 20_000,
+        };
+        let cpu = execute(&dataset(), &payload).unwrap();
+        let cpu_index = cpu.best_frequency_index - payload.frequency_start_index;
+        let simulated_gpu_index = if cpu_index + 32 < payload.frequency_count {
+            cpu_index + 32
+        } else {
+            cpu_index - 32
+        };
+
+        let refined = refine_winner(&dataset(), &payload, simulated_gpu_index).unwrap();
+
+        assert_eq!(simulated_gpu_index.abs_diff(cpu_index), 32);
+        assert_eq!(refined, cpu);
     }
 
     #[test]

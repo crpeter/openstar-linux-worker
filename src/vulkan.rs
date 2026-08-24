@@ -11,7 +11,7 @@ use std::{
     ptr,
     sync::Mutex,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct VulkanBackend {
     inner: Mutex<Context>,
@@ -332,7 +332,30 @@ impl Context {
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
             .ok_or(ComputeError::InvalidResult)?;
-        kernel::refine_winner(dataset, p, chunk_winner).map_err(BackendError::InvalidInput)
+        let refinement_range = kernel::refinement_range(p.frequency_count, chunk_winner)
+            .map_err(BackendError::InvalidInput)?;
+        let refinement_start = *refinement_range.start();
+        let refinement_end = *refinement_range.end();
+        let refined =
+            kernel::refine_winner(dataset, p, chunk_winner).map_err(BackendError::InvalidInput)?;
+        let refined_chunk_winner = refined
+            .best_frequency_index
+            .checked_sub(p.frequency_start_index)
+            .ok_or(ComputeError::InvalidResult)
+            .map_err(BackendError::InvalidInput)?;
+        debug!(
+            raw_gpu_winner_index = chunk_winner,
+            raw_gpu_winner_power = gpu_winner.best_power,
+            cpu_refinement_range_start = refinement_start,
+            cpu_refinement_range_end = refinement_end,
+            refined_winner_index = refined_chunk_winner,
+            refined_winner_power = refined.best_power,
+            raw_to_refined_distance_bins = chunk_winner.abs_diff(refined_chunk_winner),
+            refined_winner_on_range_edge =
+                refined_chunk_winner == refinement_start || refined_chunk_winner == refinement_end,
+            "Vulkan work unit CPU refinement completed"
+        );
+        Ok(refined)
     }
 }
 impl ComputeBackend for VulkanBackend {
