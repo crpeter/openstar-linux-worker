@@ -6,10 +6,12 @@ use crate::{
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use ash::{vk, Entry};
 use std::{
+    env,
     ffi::{CStr, CString},
     mem::size_of_val,
     ptr,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
@@ -28,7 +30,51 @@ struct Context {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
+    profiling: Profiling,
     resources: Option<ExecutionResources>,
+}
+
+struct Profiling {
+    enabled: bool,
+    query_pool: Option<vk::QueryPool>,
+    timestamp_valid_bits: u32,
+    timestamp_period_ns: f32,
+}
+
+#[derive(Default)]
+struct WorkUnitTimings {
+    validate: Duration,
+    host_write: Duration,
+    command_record: Duration,
+    queue_submit: Duration,
+    queue_wait: Duration,
+    gpu_dispatch: Option<Duration>,
+    readback: Duration,
+    winner_select: Duration,
+    cpu_refinement: Duration,
+}
+
+fn profiling_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_since(start: Option<Instant>) -> Duration {
+    start.map_or(Duration::ZERO, |start| start.elapsed())
+}
+
+fn timestamp_elapsed(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> Duration {
+    let mask = if valid_bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << valid_bits) - 1
+    };
+    let ticks = end.wrapping_sub(start) & mask;
+    Duration::from_secs_f64(ticks as f64 * f64::from(period_ns) / 1_000_000_000.0)
 }
 
 pub(crate) fn choose_queue(flags: &[vk::QueueFlags]) -> Option<u32> {
@@ -119,6 +165,22 @@ impl VulkanBackend {
         }
         .context("create Vulkan device")?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let profiling_enabled = profiling_flag(env::var("OPENSTAR_VULKAN_PROFILE").ok().as_deref());
+        let queue_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let timestamp_valid_bits = queue_properties[queue_family as usize].timestamp_valid_bits;
+        let query_pool = if profiling_enabled && timestamp_valid_bits > 0 {
+            Some(unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            }?)
+        } else {
+            None
+        };
         let bindings = [0, 1, 2].map(|binding| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
@@ -184,6 +246,12 @@ impl VulkanBackend {
                 pipeline_layout,
                 pipeline,
                 command_pool,
+                profiling: Profiling {
+                    enabled: profiling_enabled,
+                    query_pool,
+                    timestamp_valid_bits,
+                    timestamp_period_ns: properties.limits.timestamp_period,
+                },
                 resources: None,
             }),
         })
@@ -369,10 +437,17 @@ impl Context {
         dataset: &Dataset,
         p: &LombPayload,
     ) -> std::result::Result<LombResult, BackendError> {
+        let profile = self.profiling.enabled;
+        let total_start = profile.then(Instant::now);
+        let phase_start = profile.then(Instant::now);
         let (x, y, normalization) = kernel::validate(dataset, p)?;
         if u32::try_from(x.len()).is_err() || u32::try_from(p.frequency_count).is_err() {
             return Err(ComputeError::InvalidCount.into());
         }
+        let mut timings = WorkUnitTimings {
+            validate: elapsed_since(phase_start),
+            ..WorkUnitTimings::default()
+        };
         let mut run = || -> Result<Vec<f32>> {
             let x_size = size_of_val(x);
             let y_size = size_of_val(y);
@@ -386,8 +461,11 @@ impl Context {
                 self.grow_buffer(&mut resources.y, y_size)?;
                 self.grow_buffer(&mut resources.output, output_size)?;
                 unsafe {
+                    let phase_start = profile.then(Instant::now);
                     Self::write(&resources.x, x);
                     Self::write(&resources.y, y);
+                    timings.host_write = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
                     let infos = [
                         resources.x.buffer,
                         resources.y.buffer,
@@ -414,6 +492,9 @@ impl Context {
                         &vk::CommandBufferBeginInfo::default()
                             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                     )?;
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_reset_query_pool(cmd, query_pool, 0, 2);
+                    }
                     self.device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -441,24 +522,65 @@ impl Context {
                         0,
                         std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 20),
                     );
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            query_pool,
+                            0,
+                        );
+                    }
                     self.device
                         .cmd_dispatch(cmd, (p.frequency_count as u32).div_ceil(64), 1, 1);
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            query_pool,
+                            1,
+                        );
+                    }
                     self.device.end_command_buffer(cmd)?;
+                    timings.command_record = elapsed_since(phase_start);
                     let cmds = [cmd];
+                    let phase_start = profile.then(Instant::now);
                     self.device.queue_submit(
                         self.queue,
                         &[vk::SubmitInfo::default().command_buffers(&cmds)],
                         vk::Fence::null(),
                     )?;
+                    timings.queue_submit = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
                     self.device.queue_wait_idle(self.queue)?;
-                    Ok(Self::read_f32(&resources.output, p.frequency_count))
+                    timings.queue_wait = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        let mut timestamps = [0_u64; 2];
+                        self.device.get_query_pool_results(
+                            query_pool,
+                            0,
+                            &mut timestamps,
+                            vk::QueryResultFlags::TYPE_64,
+                        )?;
+                        timings.gpu_dispatch = Some(timestamp_elapsed(
+                            timestamps[0],
+                            timestamps[1],
+                            self.profiling.timestamp_valid_bits,
+                            self.profiling.timestamp_period_ns,
+                        ));
+                    }
+                    let powers = Self::read_f32(&resources.output, p.frequency_count);
+                    timings.readback = elapsed_since(phase_start);
+                    Ok(powers)
                 }
             })();
             self.resources = Some(resources);
             result
         };
         let powers = run().map_err(BackendError::Execution)?;
+        let phase_start = profile.then(Instant::now);
         let gpu_winner = kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)?;
+        timings.winner_select = elapsed_since(phase_start);
         let chunk_winner = gpu_winner
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
@@ -467,9 +589,11 @@ impl Context {
             .map_err(BackendError::InvalidInput)?;
         let refinement_start = *refinement_range.start();
         let refinement_end = *refinement_range.end();
+        let phase_start = profile.then(Instant::now);
         let refined = refinement_pool
             .install(|| kernel::refine_winner(dataset, p, chunk_winner))
             .map_err(BackendError::InvalidInput)?;
+        timings.cpu_refinement = elapsed_since(phase_start);
         let refined_chunk_winner = refined
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
@@ -498,6 +622,26 @@ impl Context {
             refined_winner_on_refinement_radius_edge,
             "Vulkan work unit CPU refinement completed"
         );
+        if profile {
+            info!(
+                vulkan_profile = true,
+                frequency_count = p.frequency_count,
+                sample_count = x.len(),
+                validate_ms = timings.validate.as_secs_f64() * 1_000.0,
+                host_write_ms = timings.host_write.as_secs_f64() * 1_000.0,
+                command_record_ms = timings.command_record.as_secs_f64() * 1_000.0,
+                queue_submit_ms = timings.queue_submit.as_secs_f64() * 1_000.0,
+                queue_wait_ms = timings.queue_wait.as_secs_f64() * 1_000.0,
+                gpu_dispatch_ms = timings
+                    .gpu_dispatch
+                    .map(|duration| duration.as_secs_f64() * 1_000.0),
+                readback_ms = timings.readback.as_secs_f64() * 1_000.0,
+                winner_select_ms = timings.winner_select.as_secs_f64() * 1_000.0,
+                cpu_refinement_ms = timings.cpu_refinement.as_secs_f64() * 1_000.0,
+                total_ms = elapsed_since(total_start).as_secs_f64() * 1_000.0,
+                "Vulkan work unit profile"
+            );
+        }
         Ok(refined)
     }
 }
@@ -536,6 +680,9 @@ impl Drop for Context {
                 self.device
                     .destroy_descriptor_pool(resources.descriptor_pool, None);
             }
+            if let Some(query_pool) = self.profiling.query_pool {
+                self.device.destroy_query_pool(query_pool, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
@@ -571,6 +718,27 @@ mod tests {
         assert!(capacity_sufficient(1024, 1024));
         assert!(!capacity_sufficient(1024, 1025));
         assert!(capacity_sufficient(4, 0));
+    }
+
+    #[test]
+    fn profiling_is_opt_in_and_accepts_common_true_values() {
+        assert!(!profiling_flag(None));
+        assert!(!profiling_flag(Some("")));
+        assert!(!profiling_flag(Some("0")));
+        assert!(!profiling_flag(Some("false")));
+        assert!(profiling_flag(Some("1")));
+        assert!(profiling_flag(Some(" TRUE ")));
+        assert!(profiling_flag(Some("yes")));
+        assert!(profiling_flag(Some("on")));
+    }
+
+    #[test]
+    fn timestamp_elapsed_handles_queue_counter_wraparound() {
+        assert_eq!(
+            timestamp_elapsed(100, 150, 64, 2.0),
+            Duration::from_nanos(100)
+        );
+        assert_eq!(timestamp_elapsed(250, 5, 8, 1.0), Duration::from_nanos(11));
     }
 
     #[test]
