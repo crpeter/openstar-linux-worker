@@ -111,7 +111,7 @@ pub(crate) fn refine_winner(
     let (coordinates, values, normalization) = validate(dataset, p)?;
     let range = refinement_range(p.frequency_count, winner)?;
     let powers = range
-        .clone()
+        .into_par_iter()
         .map(|index| {
             let frequency = p.start_frequency + index as f32 * p.frequency_step;
             power(coordinates, values, normalization, frequency).map(|power| (index, power))
@@ -432,5 +432,56 @@ mod tests {
         assert_eq!(result.best_frequency_index, 10_020);
         assert_eq!(result.best_frequency, 5.5);
         assert_eq!(result.best_power, 0.7);
+    }
+
+    #[test]
+    fn parallel_refinement_repeatedly_matches_full_cpu_exactly() {
+        let payload = LombPayload {
+            start_frequency: 0.1,
+            frequency_step: 0.005,
+            frequency_count: 300,
+            frequency_start_index: 20_000,
+        };
+        let expected = execute(&dataset(), &payload).unwrap();
+        let winner = expected.best_frequency_index - payload.frequency_start_index;
+
+        for _ in 0..32 {
+            assert_eq!(
+                refine_winner(&dataset(), &payload, winner).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_collection_preserves_order_and_deterministic_ties() {
+        let payload = LombPayload {
+            start_frequency: 0.5,
+            frequency_step: 0.25,
+            frequency_count: 257,
+            frequency_start_index: 10_000,
+        };
+
+        for _ in 0..32 {
+            let powers = (0..=256)
+                .into_par_iter()
+                .map(|index| {
+                    (
+                        index,
+                        if index == 100 || index == 200 {
+                            0.9
+                        } else {
+                            0.1
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(powers
+                .windows(2)
+                .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0)));
+            let result = select_indexed_winner(&payload, &powers).unwrap();
+            assert_eq!(result.best_frequency_index, 10_100);
+            assert_eq!(result.best_power, 0.9);
+        }
     }
 }

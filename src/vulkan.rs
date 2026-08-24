@@ -16,6 +16,7 @@ use tracing::{debug, info};
 pub struct VulkanBackend {
     inner: Mutex<Context>,
     name: String,
+    refinement_pool: rayon::ThreadPool,
 }
 struct Context {
     _entry: Entry,
@@ -62,8 +63,16 @@ fn device_rank(kind: vk::PhysicalDeviceType) -> u8 {
     }
 }
 
+fn build_refinement_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("create Vulkan CPU refinement thread pool")
+}
+
 impl VulkanBackend {
-    pub fn new() -> Result<Self> {
+    pub fn new(threads: usize) -> Result<Self> {
+        let refinement_pool = build_refinement_pool(threads)?;
         let entry = unsafe { Entry::load() }.context("load Vulkan loader")?;
         let app = CString::new("openstar-linux-worker")?;
         let app_info = vk::ApplicationInfo::default()
@@ -161,6 +170,7 @@ impl VulkanBackend {
         info!(device=%name, api_version=properties.api_version, driver_version=properties.driver_version, queue_family, "Vulkan device selected");
         Ok(Self {
             name,
+            refinement_pool,
             inner: Mutex::new(Context {
                 _entry: entry,
                 instance,
@@ -248,6 +258,7 @@ impl Context {
     }
     fn execute(
         &mut self,
+        refinement_pool: &rayon::ThreadPool,
         dataset: &Dataset,
         p: &LombPayload,
     ) -> std::result::Result<LombResult, BackendError> {
@@ -355,8 +366,9 @@ impl Context {
             .map_err(BackendError::InvalidInput)?;
         let refinement_start = *refinement_range.start();
         let refinement_end = *refinement_range.end();
-        let refined =
-            kernel::refine_winner(dataset, p, chunk_winner).map_err(BackendError::InvalidInput)?;
+        let refined = refinement_pool
+            .install(|| kernel::refine_winner(dataset, p, chunk_winner))
+            .map_err(BackendError::InvalidInput)?;
         let refined_chunk_winner = refined
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
@@ -397,7 +409,7 @@ impl ComputeBackend for VulkanBackend {
         self.inner
             .lock()
             .map_err(|_| BackendError::Execution(anyhow!("Vulkan context mutex poisoned")))?
-            .execute(d, p)
+            .execute(&self.refinement_pool, d, p)
     }
     fn id(&self) -> &'static str {
         "vulkan"
@@ -465,7 +477,7 @@ mod tests {
 
     #[test]
     fn matches_cpu_when_vulkan_is_available() {
-        let Ok(vulkan) = VulkanBackend::new() else {
+        let Ok(vulkan) = VulkanBackend::new(2) else {
             eprintln!("skipping: no usable Vulkan GPU");
             return;
         };
@@ -487,5 +499,11 @@ mod tests {
         assert_eq!(gpu.best_frequency, cpu.best_frequency);
         assert_eq!(gpu.best_period_days, cpu.best_period_days);
         assert!((gpu.best_power - cpu.best_power).abs() <= 1.0e-5);
+    }
+
+    #[test]
+    fn refinement_pool_honors_configured_thread_count_without_vulkan() {
+        let pool = build_refinement_pool(3).unwrap();
+        assert_eq!(pool.current_num_threads(), 3);
     }
 }
