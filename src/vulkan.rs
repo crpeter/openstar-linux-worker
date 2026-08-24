@@ -28,6 +28,7 @@ struct Context {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
+    resources: Option<ExecutionResources>,
 }
 
 pub(crate) fn choose_queue(flags: &[vk::QueueFlags]) -> Option<u32> {
@@ -163,7 +164,9 @@ impl VulkanBackend {
         unsafe { device.destroy_shader_module(shader, None) };
         let command_pool = unsafe {
             device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default().queue_family_index(queue_family),
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )
         }?;
@@ -181,6 +184,7 @@ impl VulkanBackend {
                 pipeline_layout,
                 pipeline,
                 command_pool,
+                resources: None,
             }),
         })
     }
@@ -190,7 +194,25 @@ struct Buffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+    mapped: *mut u8,
 }
+
+// Access is serialized by VulkanBackend::inner, and the mapping remains valid until cleanup.
+unsafe impl Send for Buffer {}
+
+struct ExecutionResources {
+    x: Buffer,
+    y: Buffer,
+    output: Buffer,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    command_buffer: vk::CommandBuffer,
+}
+
+fn capacity_sufficient(capacity: vk::DeviceSize, required: usize) -> bool {
+    u64::try_from(required.max(4)).is_ok_and(|required| capacity >= required)
+}
+
 impl Context {
     fn buffer(&self, size: usize) -> Result<Buffer> {
         let size = u64::try_from(size.max(4))?;
@@ -227,35 +249,81 @@ impl Context {
         unsafe {
             self.device.bind_buffer_memory(buffer, memory, 0)?;
         }
+        let mapped = unsafe {
+            self.device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?
+                .cast()
+        };
         Ok(Buffer {
             buffer,
             memory,
             size,
+            mapped,
         })
     }
-    unsafe fn write<T: Copy>(&self, b: &Buffer, values: &[T]) -> Result<()> {
+    unsafe fn write<T: Copy>(b: &Buffer, values: &[T]) {
         let bytes = size_of_val(values);
-        let mapped = unsafe {
-            self.device
-                .map_memory(b.memory, 0, b.size, vk::MemoryMapFlags::empty())?
-        };
         unsafe {
-            ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), mapped.cast(), bytes);
+            ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), b.mapped, bytes);
+        }
+    }
+    unsafe fn read_f32(b: &Buffer, count: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(b.mapped.cast::<f32>(), count) }.to_vec()
+    }
+    unsafe fn destroy_buffer(&self, b: Buffer) {
+        unsafe {
             self.device.unmap_memory(b.memory);
+            self.device.destroy_buffer(b.buffer, None);
+            self.device.free_memory(b.memory, None);
+        }
+    }
+    fn create_resources(
+        &self,
+        x_size: usize,
+        y_size: usize,
+        output_size: usize,
+    ) -> Result<ExecutionResources> {
+        unsafe {
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(3)];
+            let descriptor_pool = self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?;
+            let descriptor_set = self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&[self.descriptor_layout]),
+            )?[0];
+            let command_buffer = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            Ok(ExecutionResources {
+                x: self.buffer(x_size)?,
+                y: self.buffer(y_size)?,
+                output: self.buffer(output_size)?,
+                descriptor_pool,
+                descriptor_set,
+                command_buffer,
+            })
+        }
+    }
+
+    fn grow_buffer(&self, buffer: &mut Buffer, required: usize) -> Result<()> {
+        if !capacity_sufficient(buffer.size, required) {
+            let replacement = self.buffer(required)?;
+            let old = std::mem::replace(buffer, replacement);
+            unsafe { self.destroy_buffer(old) };
         }
         Ok(())
     }
-    unsafe fn read_f32(&self, b: &Buffer, count: usize) -> Result<Vec<f32>> {
-        let mapped = unsafe {
-            self.device
-                .map_memory(b.memory, 0, b.size, vk::MemoryMapFlags::empty())?
-        };
-        let result = unsafe { std::slice::from_raw_parts(mapped.cast::<f32>(), count) }.to_vec();
-        unsafe {
-            self.device.unmap_memory(b.memory);
-        }
-        Ok(result)
-    }
+
     fn execute(
         &mut self,
         refinement_pool: &rayon::ThreadPool,
@@ -267,94 +335,88 @@ impl Context {
             return Err(ComputeError::InvalidCount.into());
         }
         let run = || -> Result<Vec<f32>> {
-            unsafe {
-                let xb = self.buffer(size_of_val(x))?;
-                let yb = self.buffer(size_of_val(y))?;
-                let out = self.buffer(p.frequency_count * 4)?;
-                self.write(&xb, x)?;
-                self.write(&yb, y)?;
-                let pool_sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(3)];
-                let pool = self.device.create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&pool_sizes),
-                    None,
-                )?;
-                let layouts = [self.descriptor_layout];
-                let set = self.device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )?[0];
-                let infos = [xb.buffer, yb.buffer, out.buffer].map(|buffer| {
-                    [vk::DescriptorBufferInfo::default()
-                        .buffer(buffer)
-                        .range(vk::WHOLE_SIZE)]
-                });
-                let writes = [0, 1, 2].map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i])
-                });
-                self.device.update_descriptor_sets(&writes, &[]);
-                let cmd = self.device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )?[0];
-                self.device.begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                self.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
-                self.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.pipeline_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                let push = [
-                    x.len() as u32,
-                    p.frequency_count as u32,
-                    p.start_frequency.to_bits(),
-                    p.frequency_step.to_bits(),
-                    normalization.to_bits(),
-                ];
-                self.device.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 20),
-                );
-                self.device
-                    .cmd_dispatch(cmd, (p.frequency_count as u32).div_ceil(64), 1, 1);
-                self.device.end_command_buffer(cmd)?;
-                let cmds = [cmd];
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    vk::Fence::null(),
-                )?;
-                self.device.queue_wait_idle(self.queue)?;
-                let result = self.read_f32(&out, p.frequency_count)?;
-                self.device.free_command_buffers(self.command_pool, &cmds);
-                self.device.destroy_descriptor_pool(pool, None);
-                for b in [xb, yb, out] {
-                    self.device.destroy_buffer(b.buffer, None);
-                    self.device.free_memory(b.memory, None);
+            let x_size = size_of_val(x);
+            let y_size = size_of_val(y);
+            let output_size = p.frequency_count * 4;
+            let mut resources = match self.resources.take() {
+                Some(resources) => resources,
+                None => self.create_resources(x_size, y_size, output_size)?,
+            };
+            let result = (|| -> Result<Vec<f32>> {
+                self.grow_buffer(&mut resources.x, x_size)?;
+                self.grow_buffer(&mut resources.y, y_size)?;
+                self.grow_buffer(&mut resources.output, output_size)?;
+                unsafe {
+                    Self::write(&resources.x, x);
+                    Self::write(&resources.y, y);
+                    let infos = [
+                        resources.x.buffer,
+                        resources.y.buffer,
+                        resources.output.buffer,
+                    ]
+                    .map(|buffer| {
+                        [vk::DescriptorBufferInfo::default()
+                            .buffer(buffer)
+                            .range(vk::WHOLE_SIZE)]
+                    });
+                    let writes = [0, 1, 2].map(|i| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(resources.descriptor_set)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(&infos[i])
+                    });
+                    self.device.update_descriptor_sets(&writes, &[]);
+                    let cmd = resources.command_buffer;
+                    self.device
+                        .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+                    self.device.begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )?;
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.pipeline_layout,
+                        0,
+                        &[resources.descriptor_set],
+                        &[],
+                    );
+                    let push = [
+                        x.len() as u32,
+                        p.frequency_count as u32,
+                        p.start_frequency.to_bits(),
+                        p.frequency_step.to_bits(),
+                        normalization.to_bits(),
+                    ];
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 20),
+                    );
+                    self.device
+                        .cmd_dispatch(cmd, (p.frequency_count as u32).div_ceil(64), 1, 1);
+                    self.device.end_command_buffer(cmd)?;
+                    let cmds = [cmd];
+                    self.device.queue_submit(
+                        self.queue,
+                        &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                        vk::Fence::null(),
+                    )?;
+                    self.device.queue_wait_idle(self.queue)?;
+                    Ok(Self::read_f32(&resources.output, p.frequency_count))
                 }
-                Ok(result)
-            }
+            })();
+            self.resources = Some(resources);
+            result
         };
         let powers = run().map_err(BackendError::Execution)?;
         let gpu_winner = kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)?;
@@ -422,6 +484,19 @@ impl Drop for Context {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(resources) = self.resources.take() {
+                self.device.unmap_memory(resources.x.memory);
+                self.device.unmap_memory(resources.y.memory);
+                self.device.unmap_memory(resources.output.memory);
+                self.device.destroy_buffer(resources.x.buffer, None);
+                self.device.destroy_buffer(resources.y.buffer, None);
+                self.device.destroy_buffer(resources.output.buffer, None);
+                self.device.free_memory(resources.x.memory, None);
+                self.device.free_memory(resources.y.memory, None);
+                self.device.free_memory(resources.output.memory, None);
+                self.device
+                    .destroy_descriptor_pool(resources.descriptor_pool, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
@@ -449,6 +524,14 @@ mod tests {
     #[test]
     fn compute_only_is_rejected() {
         assert_eq!(choose_queue(&[vk::QueueFlags::COMPUTE]), None);
+    }
+
+    #[test]
+    fn buffer_capacity_is_reused_until_growth_is_required() {
+        assert!(capacity_sufficient(1024, 512));
+        assert!(capacity_sufficient(1024, 1024));
+        assert!(!capacity_sufficient(1024, 1025));
+        assert!(capacity_sufficient(4, 0));
     }
 
     #[test]
@@ -495,10 +578,12 @@ mod tests {
         };
         let cpu = kernel::execute(&dataset, &payload).unwrap();
         let gpu = vulkan.execute(&dataset, &payload).unwrap();
+        let repeated = vulkan.execute(&dataset, &payload).unwrap();
         assert_eq!(gpu.best_frequency_index, cpu.best_frequency_index);
         assert_eq!(gpu.best_frequency, cpu.best_frequency);
         assert_eq!(gpu.best_period_days, cpu.best_period_days);
         assert!((gpu.best_power - cpu.best_power).abs() <= 1.0e-5);
+        assert_eq!(repeated, gpu);
     }
 
     #[test]
