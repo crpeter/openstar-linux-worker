@@ -2,6 +2,8 @@ use crate::protocol::{Dataset, LombPayload, LombResult};
 use rayon::prelude::*;
 use thiserror::Error;
 
+pub(crate) const VULKAN_CPU_REFINE_RADIUS_BINS: usize = 16;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ComputeError {
     #[error("dataset must contain matching, nonempty coordinate and value arrays")]
@@ -82,6 +84,69 @@ pub(crate) fn select_winner(p: &LombPayload, powers: &[f32]) -> Result<LombResul
             Ok::<_, ComputeError>(Some(match best {
                 None => candidate,
                 Some(current) if candidate.1.total_cmp(current.1).is_gt() => candidate,
+                Some(current) => current,
+            }))
+        })?
+        .ok_or(ComputeError::InvalidCount)?;
+    let best_frequency = p.start_frequency + winner as f32 * p.frequency_step;
+    let best_frequency_index = p
+        .frequency_start_index
+        .checked_add(winner)
+        .ok_or(ComputeError::InvalidResult)?;
+    Ok(LombResult {
+        best_frequency,
+        best_period_days: 1.0 / best_frequency,
+        best_power,
+        best_frequency_index,
+    })
+}
+
+/// Recomputes the neighborhood of a chunk-relative winner with the authoritative
+/// scalar Float32 implementation and selects the best result in that neighborhood.
+pub(crate) fn refine_winner(
+    dataset: &Dataset,
+    p: &LombPayload,
+    winner: usize,
+) -> Result<LombResult, ComputeError> {
+    let (coordinates, values, normalization) = validate(dataset, p)?;
+    let range = refinement_range(p.frequency_count, winner)?;
+    let powers = range
+        .clone()
+        .map(|index| {
+            let frequency = p.start_frequency + index as f32 * p.frequency_step;
+            power(coordinates, values, normalization, frequency).map(|power| (index, power))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    select_indexed_winner(p, &powers)
+}
+
+pub(crate) fn refinement_range(
+    frequency_count: usize,
+    winner: usize,
+) -> Result<std::ops::RangeInclusive<usize>, ComputeError> {
+    if frequency_count == 0 || winner >= frequency_count {
+        return Err(ComputeError::InvalidCount);
+    }
+    let start = winner.saturating_sub(VULKAN_CPU_REFINE_RADIUS_BINS);
+    let end = winner
+        .saturating_add(VULKAN_CPU_REFINE_RADIUS_BINS)
+        .min(frequency_count - 1);
+    Ok(start..=end)
+}
+
+fn select_indexed_winner(
+    p: &LombPayload,
+    powers: &[(usize, f32)],
+) -> Result<LombResult, ComputeError> {
+    let &(winner, best_power) = powers
+        .iter()
+        .try_fold(None::<&(usize, f32)>, |best, candidate| {
+            if !candidate.1.is_finite() {
+                return Err(ComputeError::InvalidResult);
+            }
+            Ok::<_, ComputeError>(Some(match best {
+                None => candidate,
+                Some(current) if candidate.1.total_cmp(&current.1).is_gt() => candidate,
                 Some(current) => current,
             }))
         })?
@@ -286,5 +351,64 @@ mod tests {
         assert_eq!(result.best_frequency_index, 101);
         assert_eq!(result.best_frequency, 0.75);
         assert_eq!(result.best_power, 0.9);
+    }
+
+    #[test]
+    fn cpu_refinement_recovers_a_winner_displaced_by_gpu_math() {
+        let payload = LombPayload {
+            start_frequency: 0.1,
+            frequency_step: 0.025,
+            frequency_count: 64,
+            frequency_start_index: 700,
+        };
+        let cpu = execute(&dataset(), &payload).unwrap();
+        let cpu_index = cpu.best_frequency_index - payload.frequency_start_index;
+        let displaced = if cpu_index + 5 < payload.frequency_count {
+            cpu_index + 5
+        } else {
+            cpu_index - 5
+        };
+        let mut simulated_gpu_powers = vec![0.0; payload.frequency_count];
+        simulated_gpu_powers[displaced] = 1.0;
+        let gpu = select_winner(&payload, &simulated_gpu_powers).unwrap();
+        let gpu_index = gpu.best_frequency_index - payload.frequency_start_index;
+
+        let refined = refine_winner(&dataset(), &payload, gpu_index).unwrap();
+
+        assert_eq!(refined, cpu);
+        assert_ne!(gpu.best_frequency_index, cpu.best_frequency_index);
+    }
+
+    #[test]
+    fn refinement_window_clamps_at_both_chunk_boundaries() {
+        assert_eq!(
+            refinement_range(100, 0).unwrap().collect::<Vec<_>>(),
+            (0..=16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            refinement_range(100, 99).unwrap().collect::<Vec<_>>(),
+            (83..=99).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refinement_uses_at_most_thirty_three_bins() {
+        let range = refinement_range(100, 50).unwrap();
+        assert_eq!(range.count(), 33);
+    }
+
+    #[test]
+    fn refined_ties_choose_lowest_index_and_apply_global_start_index() {
+        let payload = LombPayload {
+            start_frequency: 0.5,
+            frequency_step: 0.25,
+            frequency_count: 50,
+            frequency_start_index: 10_000,
+        };
+        // These stand in for powers returned by the authoritative CPU range evaluation.
+        let result = select_indexed_winner(&payload, &[(20, 0.7), (21, 0.7)]).unwrap();
+        assert_eq!(result.best_frequency_index, 10_020);
+        assert_eq!(result.best_frequency, 5.5);
+        assert_eq!(result.best_power, 0.7);
     }
 }
