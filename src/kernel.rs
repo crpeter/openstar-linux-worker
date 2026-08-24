@@ -463,7 +463,7 @@ mod tests {
         };
 
         for _ in 0..32 {
-            let powers = (0..=256)
+            let powers = (0usize..=256)
                 .into_par_iter()
                 .map(|index| {
                     (
