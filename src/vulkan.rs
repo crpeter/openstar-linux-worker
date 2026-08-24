@@ -373,7 +373,7 @@ impl Context {
         if u32::try_from(x.len()).is_err() || u32::try_from(p.frequency_count).is_err() {
             return Err(ComputeError::InvalidCount.into());
         }
-        let run = || -> Result<Vec<f32>> {
+        let mut run = || -> Result<Vec<f32>> {
             let x_size = size_of_val(x);
             let y_size = size_of_val(y);
             let output_size = p.frequency_count * 4;
