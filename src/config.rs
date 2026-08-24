@@ -1,10 +1,11 @@
+use crate::backend::BackendChoice;
 use clap::Parser;
 use std::{path::PathBuf, time::Duration};
 use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Parser)]
-#[command(version, about = "Generic OpenStar CPU compute worker")]
+#[command(version, about = "Generic OpenStar compute worker")]
 pub struct Config {
     #[arg(long, env = "OPENSTAR_COORDINATOR_URL")]
     pub coordinator_url: Url,
@@ -20,6 +21,8 @@ pub struct Config {
     pub work_concurrency: usize,
     #[arg(long, env = "OPENSTAR_CPU_THREADS")]
     pub cpu_threads: Option<usize>,
+    #[arg(long, env = "OPENSTAR_COMPUTE_BACKEND", default_value_t = BackendChoice::Auto)]
+    pub compute_backend: BackendChoice,
     #[arg(long, env = "OPENSTAR_POLL_INTERVAL_MS", default_value_t = 2_000)]
     pub poll_interval_ms: u64,
     #[arg(long, env = "OPENSTAR_MAX_BACKOFF_MS", default_value_t = 30_000)]
@@ -100,6 +103,7 @@ mod tests {
             state_dir: directory.clone(),
             work_concurrency: 1,
             cpu_threads: Some(1),
+            compute_backend: BackendChoice::Cpu,
             poll_interval_ms: 1,
             max_backoff_ms: 2,
             request_timeout_secs: 1,

@@ -193,7 +193,7 @@ mod tests {
             capabilities: Capabilities {
                 platform: "linux",
                 hardware_identifier: "x86_64 Linux CPU".into(),
-                gpu_name: "none",
+                gpu_name: "none".to_owned(),
                 processor_count: 2,
                 memory_gb: 16.0,
                 compute_backends: vec![Backend { id: "cpu" }],
@@ -215,7 +215,10 @@ mod tests {
             &work.id,
             registration.node_id,
             result,
-            1.25,
+            ExecutionDuration {
+                backend: "cpu",
+                seconds: 1.25,
+            },
             1.25,
         ))
         .unwrap();

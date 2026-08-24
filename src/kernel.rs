@@ -19,6 +19,24 @@ pub enum ComputeError {
 }
 
 pub fn execute(dataset: &Dataset, p: &LombPayload) -> Result<LombResult, ComputeError> {
+    let (coordinates, values, normalization) = validate(dataset, p)?;
+    let powers = (0..p.frequency_count)
+        .into_par_iter()
+        .map(|index| {
+            let frequency = p.start_frequency + index as f32 * p.frequency_step;
+            if !frequency.is_finite() || frequency <= 0.0 {
+                return Err(ComputeError::InvalidFrequency);
+            }
+            power(coordinates, values, normalization, frequency)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    select_winner(p, &powers)
+}
+
+pub(crate) fn validate<'a>(
+    dataset: &'a Dataset,
+    p: &LombPayload,
+) -> Result<(&'a [f32], &'a [f32], f32), ComputeError> {
     let (coordinates, values) = dataset.series().ok_or(ComputeError::InvalidSeries)?;
     if coordinates.is_empty() || coordinates.len() != values.len() {
         return Err(ComputeError::InvalidSeries);
@@ -42,30 +60,33 @@ pub fn execute(dataset: &Dataset, p: &LombPayload) -> Result<LombResult, Compute
     if !normalization.is_finite() || normalization <= 0.0 {
         return Err(ComputeError::InvalidNormalization);
     }
-    let (winner, best_frequency, best_power) = (0..p.frequency_count)
-        .into_par_iter()
-        .map(|index| {
-            let frequency = p.start_frequency + index as f32 * p.frequency_step;
-            if !frequency.is_finite() || frequency <= 0.0 {
-                return Err(ComputeError::InvalidFrequency);
+    // Validate the last frequency before a backend starts potentially expensive work.
+    let last = p.start_frequency + (p.frequency_count - 1) as f32 * p.frequency_step;
+    if !last.is_finite() || last <= 0.0 {
+        return Err(ComputeError::InvalidFrequency);
+    }
+    Ok((coordinates, values, normalization))
+}
+
+pub(crate) fn select_winner(p: &LombPayload, powers: &[f32]) -> Result<LombResult, ComputeError> {
+    if powers.len() != p.frequency_count {
+        return Err(ComputeError::InvalidCount);
+    }
+    let (winner, &best_power) = powers
+        .iter()
+        .enumerate()
+        .try_fold(None::<(usize, &f32)>, |best, candidate| {
+            if !candidate.1.is_finite() {
+                return Err(ComputeError::InvalidResult);
             }
-            Ok((
-                index,
-                frequency,
-                power(coordinates, values, normalization, frequency)?,
-            ))
-        })
-        .try_reduce_with(|left, right| {
-            let ordering = right.2.total_cmp(&left.2);
-            Ok(
-                if ordering.is_gt() || (ordering.is_eq() && right.0 < left.0) {
-                    right
-                } else {
-                    left
-                },
-            )
-        })
-        .ok_or(ComputeError::InvalidCount)??;
+            Ok::<_, ComputeError>(Some(match best {
+                None => candidate,
+                Some(current) if candidate.1.total_cmp(current.1).is_gt() => candidate,
+                Some(current) => current,
+            }))
+        })?
+        .ok_or(ComputeError::InvalidCount)?;
+    let best_frequency = p.start_frequency + winner as f32 * p.frequency_step;
     let best_frequency_index = p
         .frequency_start_index
         .checked_add(winner)
@@ -251,5 +272,19 @@ mod tests {
                 Err(ComputeError::InvalidFrequency)
             );
         }
+    }
+
+    #[test]
+    fn winner_selection_is_deterministic_and_lowest_index_wins_ties() {
+        let payload = LombPayload {
+            start_frequency: 0.5,
+            frequency_step: 0.25,
+            frequency_count: 4,
+            frequency_start_index: 100,
+        };
+        let result = select_winner(&payload, &[0.1, 0.9, 0.9, 0.2]).unwrap();
+        assert_eq!(result.best_frequency_index, 101);
+        assert_eq!(result.best_frequency, 0.75);
+        assert_eq!(result.best_power, 0.9);
     }
 }
