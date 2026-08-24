@@ -35,6 +35,25 @@ pub(crate) fn choose_queue(flags: &[vk::QueueFlags]) -> Option<u32> {
         .position(|f| f.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
         .and_then(|i| u32::try_from(i).ok())
 }
+
+fn refinement_edge_diagnostics(
+    frequency_count: usize,
+    refinement_start: usize,
+    refinement_end: usize,
+    refined_winner: usize,
+) -> (bool, bool, bool) {
+    let final_chunk_index = frequency_count - 1;
+    let clamped_at_chunk_start = refinement_start == 0;
+    let clamped_at_chunk_end = refinement_end == final_chunk_index;
+    let winner_on_radius_edge = (refined_winner == refinement_start && refinement_start > 0)
+        || (refined_winner == refinement_end && refinement_end < final_chunk_index);
+    (
+        clamped_at_chunk_start,
+        clamped_at_chunk_end,
+        winner_on_radius_edge,
+    )
+}
+
 fn device_rank(kind: vk::PhysicalDeviceType) -> u8 {
     match kind {
         vk::PhysicalDeviceType::DISCRETE_GPU => 2,
@@ -343,6 +362,16 @@ impl Context {
             .checked_sub(p.frequency_start_index)
             .ok_or(ComputeError::InvalidResult)
             .map_err(BackendError::InvalidInput)?;
+        let (
+            refinement_range_clamped_at_chunk_start,
+            refinement_range_clamped_at_chunk_end,
+            refined_winner_on_refinement_radius_edge,
+        ) = refinement_edge_diagnostics(
+            p.frequency_count,
+            refinement_start,
+            refinement_end,
+            refined_chunk_winner,
+        );
         debug!(
             raw_gpu_winner_index = chunk_winner,
             raw_gpu_winner_power = gpu_winner.best_power,
@@ -351,8 +380,9 @@ impl Context {
             refined_winner_index = refined_chunk_winner,
             refined_winner_power = refined.best_power,
             raw_to_refined_distance_bins = chunk_winner.abs_diff(refined_chunk_winner),
-            refined_winner_on_range_edge =
-                refined_chunk_winner == refinement_start || refined_chunk_winner == refinement_end,
+            refinement_range_clamped_at_chunk_start,
+            refinement_range_clamped_at_chunk_end,
+            refined_winner_on_refinement_radius_edge,
             "Vulkan work unit CPU refinement completed"
         );
         Ok(refined)
@@ -407,6 +437,30 @@ mod tests {
     #[test]
     fn compute_only_is_rejected() {
         assert_eq!(choose_queue(&[vk::QueueFlags::COMPUTE]), None);
+    }
+
+    #[test]
+    fn refinement_diagnostics_distinguish_chunk_boundaries_from_radius_edges() {
+        assert_eq!(
+            refinement_edge_diagnostics(4096, 0, 128, 0),
+            (true, false, false)
+        );
+        assert_eq!(
+            refinement_edge_diagnostics(4096, 3967, 4095, 4095),
+            (false, true, false)
+        );
+        assert_eq!(
+            refinement_edge_diagnostics(4096, 1872, 2128, 1872),
+            (false, false, true)
+        );
+        assert_eq!(
+            refinement_edge_diagnostics(4096, 1872, 2128, 2128),
+            (false, false, true)
+        );
+        assert_eq!(
+            refinement_edge_diagnostics(4096, 1872, 2128, 2000),
+            (false, false, false)
+        );
     }
 
     #[test]
