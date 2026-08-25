@@ -19,6 +19,8 @@ pub struct Config {
     pub state_dir: PathBuf,
     #[arg(long, env = "OPENSTAR_WORK_CONCURRENCY", default_value_t = 1)]
     pub work_concurrency: usize,
+    #[arg(long, env = "OPENSTAR_WORK_BATCH_SIZE", default_value_t = 1)]
+    pub work_batch_size: usize,
     #[arg(long, env = "OPENSTAR_CPU_THREADS")]
     pub cpu_threads: Option<usize>,
     #[arg(long, env = "OPENSTAR_COMPUTE_BACKEND", default_value_t = BackendChoice::Auto)]
@@ -38,6 +40,10 @@ impl Config {
         anyhow::ensure!(
             self.work_concurrency > 0,
             "work concurrency must be positive"
+        );
+        anyhow::ensure!(
+            (1..=128).contains(&self.work_batch_size),
+            "work batch size must be between 1 and 128"
         );
         anyhow::ensure!(
             u32::try_from(self.work_concurrency).is_ok(),
@@ -102,6 +108,7 @@ mod tests {
             node_id: None,
             state_dir: directory.clone(),
             work_concurrency: 1,
+            work_batch_size: 1,
             cpu_threads: Some(1),
             compute_backend: BackendChoice::Cpu,
             poll_interval_ms: 1,
@@ -114,5 +121,27 @@ mod tests {
             config.node_identity().unwrap()
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_batch_sizes_are_rejected() {
+        let mut config = Config {
+            coordinator_url: Url::parse("http://localhost/").unwrap(),
+            node_id: Some(Uuid::new_v4()),
+            state_dir: std::env::temp_dir(),
+            work_concurrency: 1,
+            work_batch_size: 0,
+            cpu_threads: Some(1),
+            compute_backend: BackendChoice::Cpu,
+            poll_interval_ms: 1,
+            max_backoff_ms: 1,
+            request_timeout_secs: 1,
+            log_level: "info".into(),
+        };
+        assert!(config.validate().is_err());
+        config.work_batch_size = 129;
+        assert!(config.validate().is_err());
+        config.work_batch_size = 128;
+        assert!(config.validate().is_ok());
     }
 }
