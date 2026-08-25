@@ -155,7 +155,16 @@ async fn process(
     work: WorkUnit,
     max_backoff: u64,
 ) {
-    process_with_dataset(client, backend, node_id, work, max_backoff, None).await;
+    process_with_dataset(
+        client,
+        backend,
+        node_id,
+        work,
+        max_backoff,
+        None,
+        Instant::now(),
+    )
+    .await;
 }
 
 async fn process_batch(
@@ -187,6 +196,7 @@ async fn process_batch(
         return;
     }
 
+    let shared_fetch_started = Instant::now();
     let dataset = match fetch_with_retry(&client, &batch[0], max_backoff).await {
         Ok(dataset) => Arc::new(dataset),
         Err(error) => {
@@ -204,7 +214,14 @@ async fn process_batch(
             return;
         }
     };
-    for work in batch {
+    for (index, work) in batch.into_iter().enumerate() {
+        // Charge the one shared transfer to exactly one result so summed worker
+        // durations retain the same aggregate throughput meaning as legacy mode.
+        let started = if index == 0 {
+            shared_fetch_started
+        } else {
+            Instant::now()
+        };
         process_with_dataset(
             client.clone(),
             backend.clone(),
@@ -212,6 +229,7 @@ async fn process_batch(
             work,
             max_backoff,
             Some(dataset.clone()),
+            started,
         )
         .await;
     }
@@ -224,8 +242,8 @@ async fn process_with_dataset(
     work: WorkUnit,
     max_backoff: u64,
     shared_dataset: Option<Arc<Dataset>>,
+    started: Instant,
 ) {
-    let started = Instant::now();
     let result = if work.workload_id != LOMB_SCARGLE_V1 {
         WorkResult::failed(
             &work.id,
@@ -569,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_an_active_result_submission() {
+    async fn shutdown_drains_an_entire_active_batch() {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
@@ -580,13 +598,25 @@ mod tests {
             .await;
         server.mock_async(|when, then| { when.method(POST).path("/v1/work/claim")
             .json_body(serde_json::json!({"nodeID":"00000000-0000-4000-8000-000000000001","maxWorkUnits":2}));
-            then.status(200).json_body(serde_json::json!([{"id":"w","projectID":"p","workloadID":LOMB_SCARGLE_V1,
-                "datasetID":"d","payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}}])); }).await;
+            then.status(200).json_body(serde_json::json!([
+                {"id":"w1","projectID":"p","workloadID":LOMB_SCARGLE_V1,"datasetID":"d",
+                    "payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}},
+                {"id":"w2","projectID":"p","workloadID":LOMB_SCARGLE_V1,"datasetID":"d",
+                    "payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}}
+            ])); }).await;
         let dataset = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d");
             then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
-        let result = server
+        let first_result = server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1/work/w/result");
+                when.method(POST).path("/v1/work/w1/result");
+                then.delay(Duration::from_millis(100))
+                    .status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let second_result = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/work/w2/result");
                 then.delay(Duration::from_millis(100))
                     .status(200)
                     .json_body(serde_json::json!({"accepted":true}));
@@ -607,12 +637,17 @@ mod tests {
         };
         let worker = Worker::new(config).unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(worker.run(stop_rx));
+        let mut task = tokio::spawn(worker.run(stop_rx));
         while dataset.hits_async().await == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         stop_tx.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut task)
+            .await
+            .is_err());
         task.await.unwrap().unwrap();
-        result.assert_async().await;
+        assert_eq!(dataset.hits_async().await, 1);
+        first_result.assert_async().await;
+        second_result.assert_async().await;
     }
 }
