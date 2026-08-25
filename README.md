@@ -36,6 +36,7 @@ path prefix. CLI flags correspond to the environment keys below; see `--help`.
 | `OPENSTAR_NODE_ID` | generated | Explicit stable node UUID |
 | `OPENSTAR_STATE_DIR` | `/var/lib/openstar-worker` | Stores generated node identity |
 | `OPENSTAR_WORK_CONCURRENCY` | `1` | Simultaneously claimed units |
+| `OPENSTAR_WORK_BATCH_SIZE` | `1` | Units claimed together (1–128); a batch shares one dataset download |
 | `OPENSTAR_CPU_THREADS` | host parallelism | Rayon CPU threads |
 | `OPENSTAR_COMPUTE_BACKEND` | `auto` | `auto`, `cpu`, or `vulkan` |
 | `OPENSTAR_POLL_INTERVAL_MS` | `2000` | Delay after no work |

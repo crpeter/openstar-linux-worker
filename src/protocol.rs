@@ -51,6 +51,14 @@ pub struct ClaimRequest<'a> {
     pub node_id: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchClaimRequest<'a> {
+    #[serde(rename = "nodeID")]
+    pub node_id: &'a str,
+    pub max_work_units: usize,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkUnit {

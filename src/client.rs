@@ -66,6 +66,22 @@ impl Coordinator {
         Ok(Some(response.error_for_status()?.json().await?))
     }
 
+    pub async fn claim_batch(&self, node_id: &str, max_work_units: usize) -> Result<Vec<WorkUnit>> {
+        let response = self
+            .http
+            .post(self.url("v1/work/claim")?)
+            .json(&BatchClaimRequest {
+                node_id,
+                max_work_units,
+            })
+            .send()
+            .await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(Vec::new());
+        }
+        Ok(response.error_for_status()?.json().await?)
+    }
+
     pub async fn dataset(&self, work: &WorkUnit) -> Result<Dataset, RequestError> {
         let url = self.base.join(&format!(
             "v1/projects/{}/datasets/{}",
@@ -118,6 +134,41 @@ mod tests {
     use super::*;
     use crate::kernel;
     use httpmock::{Method::POST, MockServer};
+
+    #[tokio::test]
+    async fn claim_shapes_match_the_selected_mode() {
+        let server = MockServer::start_async().await;
+        let legacy = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/claim")
+                    .json_body(serde_json::json!({"nodeID":"n"}));
+                then.status(204);
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(client.claim("n").await.unwrap().is_none());
+        legacy.assert_async().await;
+        legacy.delete_async().await;
+
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/claim")
+                    .json_body(serde_json::json!({"nodeID":"n","maxWorkUnits":2}));
+                then.status(200).json_body(serde_json::json!([{
+                    "id":"w", "projectID":"p", "workloadID":LOMB_SCARGLE_V1,
+                    "datasetID":"d", "payload":null
+                }]));
+            })
+            .await;
+        assert_eq!(client.claim_batch("n", 2).await.unwrap().len(), 1);
+        batch.assert_async().await;
+    }
 
     #[tokio::test]
     async fn accepted_false_is_still_transport_success_and_conflict_is_permanent() {

@@ -83,8 +83,18 @@ impl Worker {
                 permit = permits.clone().acquire_owned() => permit?,
                 changed = stop.changed() => { changed?; break; }
             };
-            match self.client.claim(&self.node_id).await {
-                Ok(Some(work)) => {
+            let claim = if self.config.work_batch_size == 1 {
+                self.client
+                    .claim(&self.node_id)
+                    .await
+                    .map(|work| work.into_iter().collect())
+            } else {
+                self.client
+                    .claim_batch(&self.node_id, self.config.work_batch_size)
+                    .await
+            };
+            match claim {
+                Ok(batch) if !batch.is_empty() => {
                     backoff = self.config.poll_interval_ms;
                     let (client, backend, node_id) = (
                         self.client.clone(),
@@ -94,10 +104,10 @@ impl Worker {
                     let max = self.config.max_backoff_ms;
                     drop(tokio::spawn(async move {
                         let _permit = permit;
-                        process(client, backend, node_id, work, max).await;
+                        process_batch(client, backend, node_id, batch, max).await;
                     }));
                 }
-                Ok(None) => {
+                Ok(_) => {
                     drop(permit);
                     sleep_or_stop(
                         Duration::from_millis(self.config.poll_interval_ms),
@@ -145,7 +155,95 @@ async fn process(
     work: WorkUnit,
     max_backoff: u64,
 ) {
-    let started = Instant::now();
+    process_with_dataset(
+        client,
+        backend,
+        node_id,
+        work,
+        max_backoff,
+        None,
+        Instant::now(),
+    )
+    .await;
+}
+
+async fn process_batch(
+    client: Coordinator,
+    backend: Arc<dyn ComputeBackend>,
+    node_id: String,
+    batch: Vec<WorkUnit>,
+    max_backoff: u64,
+) {
+    let homogeneous = batch.first().is_some_and(|first| {
+        batch.iter().all(|work| {
+            work.project_id == first.project_id
+                && work.dataset_id == first.dataset_id
+                && work.workload_id == first.workload_id
+        })
+    });
+    if !homogeneous || batch[0].workload_id != LOMB_SCARGLE_V1 {
+        warn!("non-homogeneous or unsupported batch; processing work units individually");
+        for work in batch {
+            process(
+                client.clone(),
+                backend.clone(),
+                node_id.clone(),
+                work,
+                max_backoff,
+            )
+            .await;
+        }
+        return;
+    }
+
+    let shared_fetch_started = Instant::now();
+    let dataset = match fetch_with_retry(&client, &batch[0], max_backoff).await {
+        Ok(dataset) => Arc::new(dataset),
+        Err(error) => {
+            warn!(%error, "shared dataset fetch failed; processing work units individually");
+            for work in batch {
+                process(
+                    client.clone(),
+                    backend.clone(),
+                    node_id.clone(),
+                    work,
+                    max_backoff,
+                )
+                .await;
+            }
+            return;
+        }
+    };
+    for (index, work) in batch.into_iter().enumerate() {
+        // Charge the one shared transfer to exactly one result so summed worker
+        // durations retain the same aggregate throughput meaning as legacy mode.
+        let started = if index == 0 {
+            shared_fetch_started
+        } else {
+            Instant::now()
+        };
+        process_with_dataset(
+            client.clone(),
+            backend.clone(),
+            node_id.clone(),
+            work,
+            max_backoff,
+            Some(dataset.clone()),
+            started,
+        )
+        .await;
+    }
+}
+
+async fn process_with_dataset(
+    client: Coordinator,
+    backend: Arc<dyn ComputeBackend>,
+    node_id: String,
+    work: WorkUnit,
+    max_backoff: u64,
+    shared_dataset: Option<Arc<Dataset>>,
+    started: Instant,
+) {
     let result = if work.workload_id != LOMB_SCARGLE_V1 {
         WorkResult::failed(
             &work.id,
@@ -155,7 +253,13 @@ async fn process(
             format!("unsupported workload: {}", work.workload_id),
         )
     } else {
-        match fetch_with_retry(&client, &work, max_backoff).await {
+        let dataset = match shared_dataset {
+            Some(dataset) => Ok(dataset),
+            None => fetch_with_retry(&client, &work, max_backoff)
+                .await
+                .map(Arc::new),
+        };
+        match dataset {
             Ok(dataset) => match work.lomb_payload() {
                 Err(message) => WorkResult::failed(
                     &work.id,
@@ -390,8 +494,100 @@ mod tests {
         submission.assert_async().await;
     }
 
+    fn test_work(id: &str, project: &str, dataset: &str) -> WorkUnit {
+        WorkUnit {
+            id: id.into(),
+            project_id: project.into(),
+            workload_id: LOMB_SCARGLE_V1.into(),
+            dataset_id: dataset.into(),
+            payload: Some(serde_json::json!({
+                "startFrequency": 1.0, "frequencyStep": 1.0, "frequencyCount": 1
+            })),
+            start_frequency: None,
+            frequency_step: None,
+            frequency_count: None,
+            frequency_start_index: None,
+        }
+    }
+
     #[tokio::test]
-    async fn shutdown_drains_an_active_result_submission() {
+    async fn homogeneous_batch_fetches_once_and_submits_each_unit() {
+        let server = MockServer::start_async().await;
+        let dataset = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d");
+            then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
+        let first = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/w1/result")
+                    .body_contains("\"workUnitID\":\"w1\"");
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let second = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/w2/result")
+                    .body_contains("\"workUnitID\":\"w2\"");
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let backend = backend::initialize(crate::backend::BackendChoice::Cpu, 1).unwrap();
+        process_batch(
+            client,
+            backend,
+            "n".into(),
+            vec![test_work("w1", "p", "d"), test_work("w2", "p", "d")],
+            1,
+        )
+        .await;
+        assert_eq!(dataset.hits_async().await, 1);
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn non_homogeneous_batch_uses_individual_dataset_processing() {
+        let server = MockServer::start_async().await;
+        let d1 = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d1");
+            then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
+        let d2 = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d2");
+            then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
+        for id in ["w1", "w2"] {
+            server
+                .mock_async(move |when, then| {
+                    when.method(POST).path(format!("/v1/work/{id}/result"));
+                    then.status(200)
+                        .json_body(serde_json::json!({"accepted":true}));
+                })
+                .await;
+        }
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let backend = backend::initialize(crate::backend::BackendChoice::Cpu, 1).unwrap();
+        process_batch(
+            client,
+            backend,
+            "n".into(),
+            vec![test_work("w1", "p", "d1"), test_work("w2", "p", "d2")],
+            1,
+        )
+        .await;
+        d1.assert_async().await;
+        d2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_entire_active_batch() {
         let server = MockServer::start_async().await;
         server
             .mock_async(|when, then| {
@@ -400,14 +596,27 @@ mod tests {
                     .json_body(serde_json::json!({"accepted":true,"message":"ok"}));
             })
             .await;
-        server.mock_async(|when, then| { when.method(POST).path("/v1/work/claim");
-            then.status(200).json_body(serde_json::json!({"id":"w","projectID":"p","workloadID":LOMB_SCARGLE_V1,
-                "datasetID":"d","payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}})); }).await;
+        server.mock_async(|when, then| { when.method(POST).path("/v1/work/claim")
+            .json_body(serde_json::json!({"nodeID":"00000000-0000-4000-8000-000000000001","maxWorkUnits":2}));
+            then.status(200).json_body(serde_json::json!([
+                {"id":"w1","projectID":"p","workloadID":LOMB_SCARGLE_V1,"datasetID":"d",
+                    "payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}},
+                {"id":"w2","projectID":"p","workloadID":LOMB_SCARGLE_V1,"datasetID":"d",
+                    "payload":{"startFrequency":1.0,"frequencyStep":1.0,"frequencyCount":1}}
+            ])); }).await;
         let dataset = server.mock_async(|when, then| { when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d");
             then.status(200).json_body(serde_json::json!({"coordinates":[0.0,0.25,0.5,0.75],"values":[2.0,3.0,2.0,1.0]})); }).await;
-        let result = server
+        let first_result = server
             .mock_async(|when, then| {
-                when.method(POST).path("/v1/work/w/result");
+                when.method(POST).path("/v1/work/w1/result");
+                then.delay(Duration::from_millis(100))
+                    .status(200)
+                    .json_body(serde_json::json!({"accepted":true}));
+            })
+            .await;
+        let second_result = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/work/w2/result");
                 then.delay(Duration::from_millis(100))
                     .status(200)
                     .json_body(serde_json::json!({"accepted":true}));
@@ -418,6 +627,7 @@ mod tests {
             node_id: Some(Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap()),
             state_dir: std::env::temp_dir(),
             work_concurrency: 1,
+            work_batch_size: 2,
             cpu_threads: Some(1),
             compute_backend: crate::backend::BackendChoice::Cpu,
             poll_interval_ms: 10,
@@ -427,12 +637,17 @@ mod tests {
         };
         let worker = Worker::new(config).unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(worker.run(stop_rx));
+        let mut task = tokio::spawn(worker.run(stop_rx));
         while dataset.hits_async().await == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         stop_tx.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut task)
+            .await
+            .is_err());
         task.await.unwrap().unwrap();
-        result.assert_async().await;
+        assert_eq!(dataset.hits_async().await, 1);
+        first_result.assert_async().await;
+        second_result.assert_async().await;
     }
 }
