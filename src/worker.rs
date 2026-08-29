@@ -63,12 +63,19 @@ impl Worker {
                     compute_backends: if self.backend.id() == "cpu" {
                         vec![Backend { id: "cpu" }]
                     } else {
-                        vec![Backend { id: self.backend.id() }, Backend { id: "cpu" }]
+                        vec![
+                            Backend {
+                                id: self.backend.id(),
+                            },
+                            Backend { id: "cpu" },
+                        ]
                     },
                     workloads: vec![
                         WorkloadCapability {
                             workload_id: LOMB_SCARGLE_V1,
-                            execution_backends: vec![Backend { id: self.backend.id() }],
+                            execution_backends: vec![Backend {
+                                id: self.backend.id(),
+                            }],
                             validator_id: None,
                         },
                         WorkloadCapability {
@@ -200,7 +207,10 @@ async fn process_batch(
         })
     });
     if !homogeneous
-        || !matches!(batch[0].workload_id.as_str(), LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1)
+        || !matches!(
+            batch[0].workload_id.as_str(),
+            LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1
+        )
     {
         warn!("non-homogeneous or unsupported batch; processing work units individually");
         for work in batch {
@@ -268,7 +278,10 @@ async fn process_with_dataset(
     shared_dataset: Option<Arc<Dataset>>,
     started: Instant,
 ) {
-    let result = if !matches!(work.workload_id.as_str(), LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1) {
+    let result = if !matches!(
+        work.workload_id.as_str(),
+        LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1
+    ) {
         WorkResult::failed(
             &work.id,
             &node_id,
@@ -284,7 +297,9 @@ async fn process_with_dataset(
                 .map(Arc::new),
         };
         match dataset {
-            Ok(dataset) if work.workload_id == BOX_PERIOD_SEARCH_V1 => match work.box_period_payload() {
+            Ok(dataset) if work.workload_id == BOX_PERIOD_SEARCH_V1 => match work
+                .box_period_payload()
+            {
                 Err(message) => WorkResult::failed(
                     &work.id,
                     &node_id,
@@ -295,17 +310,20 @@ async fn process_with_dataset(
                 Ok(payload) => {
                     let computation = tokio::task::spawn_blocking(move || {
                         let execution_started = Instant::now();
-                        let output = box_pool.install(|| {
-                            crate::box_period_search::execute(&dataset, &payload)
-                        });
+                        let output = box_pool
+                            .install(|| crate::box_period_search::execute(&dataset, &payload));
                         (output, execution_started.elapsed().as_secs_f64())
-                    }).await;
+                    })
+                    .await;
                     match computation {
                         Ok((Ok(output), execution_duration)) => WorkResult::completed_box_period(
                             &work.id,
                             &node_id,
                             output,
-                            ExecutionDuration { backend: "cpu", seconds: execution_duration },
+                            ExecutionDuration {
+                                backend: "cpu",
+                                seconds: execution_duration,
+                            },
                             started.elapsed().as_secs_f64(),
                         ),
                         Ok((Err(error), _)) => WorkResult::failed(
@@ -450,7 +468,12 @@ mod tests {
     use uuid::Uuid;
 
     fn test_box_pool() -> Arc<rayon::ThreadPool> {
-        Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap())
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -602,32 +625,52 @@ mod tests {
     async fn periodic_box_work_executes_on_cpu_and_submits_generic_payload() {
         let server = MockServer::start_async().await;
         let coordinates = (0..80).map(|index| index as f32 * 0.25).collect::<Vec<_>>();
-        let values = coordinates.iter().map(|time| {
-            let cycles = *time * 0.5;
-            if cycles - cycles.floor() < 0.15 { -2.0 } else { 0.25 }
-        }).collect::<Vec<_>>();
-        let dataset = server.mock_async(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/projects/p/datasets/d");
-            then.status(200).json_body(serde_json::json!({
-                "coordinates": coordinates, "values": values
-            }));
-        }).await;
-        let submission = server.mock_async(|when, then| {
-            when.method(POST).path("/v1/work/box/result")
-                .body_contains(r#""bestFrequencyIndex":22"#)
-                .body_contains(r#""bestDurationIndex":1"#)
-                .body_contains(r#""bestScore":"#);
-            then.status(200).json_body(serde_json::json!({"accepted": true}));
-        }).await;
+        let values = coordinates
+            .iter()
+            .map(|time| {
+                let cycles = *time * 0.5;
+                if cycles - cycles.floor() < 0.15 {
+                    -2.0
+                } else {
+                    0.25
+                }
+            })
+            .collect::<Vec<_>>();
+        let dataset = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/v1/projects/p/datasets/d");
+                then.status(200).json_body(serde_json::json!({
+                    "coordinates": coordinates, "values": values
+                }));
+            })
+            .await;
+        let submission = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/box/result")
+                    .body_contains(r#""bestFrequencyIndex":22"#)
+                    .body_contains(r#""bestDurationIndex":1"#)
+                    .body_contains(r#""bestScore":"#);
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted": true}));
+            })
+            .await;
         let client = Coordinator::new(
             Url::parse(&format!("{}/", server.base_url())).unwrap(),
             Duration::from_secs(1),
-        ).unwrap();
+        )
+        .unwrap();
         let backend = backend::initialize(crate::backend::BackendChoice::Cpu, 1).unwrap();
         process(
-            client, backend, test_box_pool(), "n".into(),
-            test_box_work("box", "p", "d"), 1,
-        ).await;
+            client,
+            backend,
+            test_box_pool(),
+            "n".into(),
+            test_box_work("box", "p", "d"),
+            1,
+        )
+        .await;
         assert_eq!(dataset.hits_async().await, 1);
         submission.assert_async().await;
     }

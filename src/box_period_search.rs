@@ -68,7 +68,11 @@ fn validate<'a>(
     if coordinates.is_empty() || coordinates.len() != values.len() {
         return Err(BoxPeriodError::InvalidSeries);
     }
-    if coordinates.iter().chain(values).any(|value| !value.is_finite()) {
+    if coordinates
+        .iter()
+        .chain(values)
+        .any(|value| !value.is_finite())
+    {
         return Err(BoxPeriodError::NonFinite);
     }
     if payload.frequency_count == 0
@@ -79,8 +83,8 @@ fn validate<'a>(
     {
         return Err(BoxPeriodError::InvalidFrequencyGrid);
     }
-    let last = payload.start_frequency
-        + (payload.frequency_count - 1) as f32 * payload.frequency_step;
+    let last =
+        payload.start_frequency + (payload.frequency_count - 1) as f32 * payload.frequency_step;
     if !last.is_finite() || last <= 0.0 {
         return Err(BoxPeriodError::InvalidFrequencyGrid);
     }
@@ -97,8 +101,7 @@ fn validate<'a>(
     }
     if payload.minimum_in_box_samples == 0
         || payload.minimum_out_of_box_samples == 0
-        || payload.minimum_in_box_samples + payload.minimum_out_of_box_samples
-            > coordinates.len()
+        || payload.minimum_in_box_samples + payload.minimum_out_of_box_samples > coordinates.len()
     {
         return Err(BoxPeriodError::InvalidSampleGates);
     }
@@ -118,8 +121,8 @@ fn score_frequency(
     for (&coordinate, &value) in coordinates.iter().zip(values) {
         let cycles = coordinate * frequency;
         let phase = cycles - cycles.floor();
-        let bin = ((phase * payload.phase_bin_count as f32) as usize)
-            .min(payload.phase_bin_count - 1);
+        let bin =
+            ((phase * payload.phase_bin_count as f32) as usize).min(payload.phase_bin_count - 1);
         sums[bin] += value;
         counts[bin] += 1;
         total_sum += value;
@@ -137,7 +140,8 @@ fn score_frequency(
                 && outside_count >= payload.minimum_out_of_box_samples
             {
                 let outside_sum = total_sum - inside_sum;
-                let contrast = outside_sum / outside_count as f32 - inside_sum / inside_count as f32;
+                let contrast =
+                    outside_sum / outside_count as f32 - inside_sum / inside_count as f32;
                 let score = contrast
                     * ((inside_count as f32 * outside_count as f32) / total_count as f32).sqrt();
                 if score.is_finite() {
@@ -150,7 +154,10 @@ fn score_frequency(
                         in_box_samples: inside_count,
                         out_of_box_samples: outside_count,
                     };
-                    best = Some(match best { None => candidate, Some(current) => select_better(current, candidate) });
+                    best = Some(match best {
+                        None => candidate,
+                        Some(current) => select_better(current, candidate),
+                    });
                 }
             }
             let leaving = phase_bin;
@@ -188,14 +195,35 @@ mod tests {
 
     fn fixture() -> (Dataset, BoxPeriodPayload) {
         let coordinates = (0..80).map(|index| index as f32 * 0.25).collect::<Vec<_>>();
-        let values = coordinates.iter().map(|time| {
-            let phase = (*time * 0.5) - (*time * 0.5).floor();
-            if phase < 0.15 { -2.0 } else { 0.25 }
-        }).collect();
-        (Dataset { coordinates: Some(coordinates), values: Some(values), times: None, flux: None },
-         BoxPeriodPayload { start_frequency: 0.4, frequency_step: 0.05, frequency_count: 5,
-            frequency_start_index: 20, phase_bin_count: 20, duration_fractions: vec![0.1, 0.15],
-            minimum_in_box_samples: 4, minimum_out_of_box_samples: 20 })
+        let values = coordinates
+            .iter()
+            .map(|time| {
+                let phase = (*time * 0.5) - (*time * 0.5).floor();
+                if phase < 0.15 {
+                    -2.0
+                } else {
+                    0.25
+                }
+            })
+            .collect();
+        (
+            Dataset {
+                coordinates: Some(coordinates),
+                values: Some(values),
+                times: None,
+                flux: None,
+            },
+            BoxPeriodPayload {
+                start_frequency: 0.4,
+                frequency_step: 0.05,
+                frequency_count: 5,
+                frequency_start_index: 20,
+                phase_bin_count: 20,
+                duration_fractions: vec![0.1, 0.15],
+                minimum_in_box_samples: 4,
+                minimum_out_of_box_samples: 20,
+            },
+        )
     }
 
     #[test]
@@ -217,6 +245,9 @@ mod tests {
     fn rejects_invalid_contract_values() {
         let (dataset, mut payload) = fixture();
         payload.phase_bin_count = 1;
-        assert_eq!(execute(&dataset, &payload), Err(BoxPeriodError::InvalidPhaseBinCount));
+        assert_eq!(
+            execute(&dataset, &payload),
+            Err(BoxPeriodError::InvalidPhaseBinCount)
+        );
     }
 }

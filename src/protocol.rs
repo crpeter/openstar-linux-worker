@@ -262,7 +262,6 @@ impl WorkResult {
         }
     }
 
-
     pub fn completed_box_period(
         work_id: &str,
         node_id: &str,
@@ -454,7 +453,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(value["payload"]["bestFrequencyIndex"], 22);
-        assert_eq!(value["payload"]["bestScore"], serde_json::json!(8.714213_f32));
+        assert_eq!(
+            value["payload"]["bestScore"],
+            serde_json::json!(8.714213_f32)
+        );
         assert_eq!(value["payload"]["cpuDurationSeconds"], 0.25);
         assert!(value["bestFrequency"].is_null());
         assert!(value["bestPower"].is_null());
