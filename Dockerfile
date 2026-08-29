@@ -1,6 +1,8 @@
 FROM rust:1.88-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY shaders ./shaders
 COPY src ./src
 RUN cargo build --locked --release
 
