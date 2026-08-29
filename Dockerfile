@@ -1,6 +1,11 @@
 FROM rust:1.88-bookworm AS build
 WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake ninja-build \
+ && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY shaders ./shaders
 COPY src ./src
 RUN cargo build --locked --release
 

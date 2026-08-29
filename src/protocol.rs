@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const LOMB_SCARGLE_V1: &str = "openstar.lomb-scargle.v1";
+pub const BOX_PERIOD_SEARCH_V1: &str = "openstar.box-period-search.v1";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +126,38 @@ impl WorkUnit {
             })
         }
     }
+
+    pub fn box_period_payload(&self) -> Result<BoxPeriodPayload, String> {
+        let value = self.payload.clone().ok_or("missing payload")?;
+        serde_json::from_value(value).map_err(|e| format!("invalid payload: {e}"))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoxPeriodPayload {
+    pub start_frequency: f32,
+    pub frequency_step: f32,
+    pub frequency_count: usize,
+    #[serde(default)]
+    pub frequency_start_index: usize,
+    pub phase_bin_count: usize,
+    pub duration_fractions: Vec<f32>,
+    pub minimum_in_box_samples: usize,
+    pub minimum_out_of_box_samples: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxPeriodResult {
+    pub best_frequency: f32,
+    pub best_score: f32,
+    pub best_phase: f32,
+    pub best_duration_fraction: f32,
+    pub best_frequency_index: usize,
+    pub best_duration_index: usize,
+    pub best_phase_bin: usize,
+    pub in_box_samples: usize,
+    pub out_of_box_samples: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,7 +177,7 @@ pub struct WorkResult {
     pub node_id: String,
     pub status: ResultStatus,
     pub duration: f64,
-    pub payload: Option<ResultPayload>,
+    pub payload: Option<WorkResultPayload>,
     pub error_message: Option<String>,
     pub failure_kind: Option<FailureKind>,
     pub best_frequency: Option<f32>,
@@ -171,6 +204,29 @@ pub struct ResultPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_duration_seconds: Option<f64>,
     pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoxPeriodResultPayload {
+    pub best_frequency: f32,
+    pub best_score: f32,
+    pub best_phase: f32,
+    pub best_duration_fraction: f32,
+    pub best_frequency_index: usize,
+    pub best_duration_index: usize,
+    pub best_phase_bin: usize,
+    pub in_box_samples: usize,
+    pub out_of_box_samples: usize,
+    pub cpu_duration_seconds: f64,
+    pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum WorkResultPayload {
+    Lomb(ResultPayload),
+    BoxPeriod(BoxPeriodResultPayload),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,12 +276,47 @@ impl WorkResult {
             node_id: node_id.into(),
             status: ResultStatus::Completed,
             duration: total_duration,
-            payload: Some(payload),
+            payload: Some(WorkResultPayload::Lomb(payload)),
             error_message: None,
             failure_kind: None,
             best_frequency: Some(result.best_frequency),
             best_period_days: Some(result.best_period_days),
             best_power: Some(result.best_power),
+        }
+    }
+
+    pub fn completed_box_period(
+        work_id: &str,
+        node_id: &str,
+        result: BoxPeriodResult,
+        execution_duration: ExecutionDuration,
+        total_duration: f64,
+    ) -> Self {
+        debug_assert_eq!(execution_duration.backend, "cpu");
+        let payload = BoxPeriodResultPayload {
+            best_frequency: result.best_frequency,
+            best_score: result.best_score,
+            best_phase: result.best_phase,
+            best_duration_fraction: result.best_duration_fraction,
+            best_frequency_index: result.best_frequency_index,
+            best_duration_index: result.best_duration_index,
+            best_phase_bin: result.best_phase_bin,
+            in_box_samples: result.in_box_samples,
+            out_of_box_samples: result.out_of_box_samples,
+            cpu_duration_seconds: execution_duration.seconds,
+            total_workload_duration_seconds: total_duration,
+        };
+        Self {
+            work_unit_id: work_id.into(),
+            node_id: node_id.into(),
+            status: ResultStatus::Completed,
+            duration: total_duration,
+            payload: Some(WorkResultPayload::BoxPeriod(payload)),
+            error_message: None,
+            failure_kind: None,
+            best_frequency: None,
+            best_period_days: None,
+            best_power: None,
         }
     }
 
@@ -355,5 +446,38 @@ mod tests {
         assert!(!payload.contains_key("cpuDurationSeconds"));
         assert_eq!(payload["totalWorkloadDurationSeconds"], 0.5);
         assert_eq!(value["duration"], 0.5);
+    }
+
+    #[test]
+    fn completed_box_result_uses_only_generic_payload_fields() {
+        let value = serde_json::to_value(WorkResult::completed_box_period(
+            "work",
+            "node",
+            BoxPeriodResult {
+                best_frequency: 0.5,
+                best_score: 8.714213,
+                best_phase: 0.0,
+                best_duration_fraction: 0.15,
+                best_frequency_index: 22,
+                best_duration_index: 1,
+                best_phase_bin: 0,
+                in_box_samples: 20,
+                out_of_box_samples: 60,
+            },
+            ExecutionDuration {
+                backend: "cpu",
+                seconds: 0.25,
+            },
+            0.5,
+        ))
+        .unwrap();
+        assert_eq!(value["payload"]["bestFrequencyIndex"], 22);
+        assert_eq!(
+            value["payload"]["bestScore"],
+            serde_json::json!(8.714213_f32)
+        );
+        assert_eq!(value["payload"]["cpuDurationSeconds"], 0.25);
+        assert!(value["bestFrequency"].is_null());
+        assert!(value["bestPower"].is_null());
     }
 }

@@ -1,12 +1,15 @@
 # OpenStar Linux worker
 
 A headless, generic CPU/Vulkan compute worker. It registers with an OpenStar coordinator,
-claims opaque work, downloads its referenced dataset, and currently dispatches only
-`openstar.lomb-scargle.v1`. It contains no dataset discovery or science orchestration.
+claims opaque work, downloads its referenced dataset, and dispatches
+`openstar.lomb-scargle.v1` plus the CPU-only generic
+`openstar.box-period-search.v1`. It contains no dataset discovery or science orchestration.
 
 The wire models follow the verified `openstarserver/main` contract and the CPU
 kernel follows the Float32 scalar semantics of the validator in `OpenStar/main`.
 Registration supplies a persistent node UUID and advertises the backend actually selected.
+Periodic-box work phase-bins each assigned frequency and scores circular low-value
+windows with deterministic Float32 tie-breaking; it makes no scientific classification.
 Vulkan is optional; normal installations need only a Vulkan loader and driver because
 the GLSL compute shader is compiled to SPIR-V by `shaderc` at build time and embedded.
 

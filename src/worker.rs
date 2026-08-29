@@ -17,6 +17,7 @@ pub struct Worker {
     config: Config,
     client: Coordinator,
     backend: Arc<dyn ComputeBackend>,
+    box_pool: Arc<rayon::ThreadPool>,
     node_id: String,
 }
 
@@ -30,11 +31,17 @@ impl Worker {
                 .unwrap_or(1)
         });
         let backend = backend::initialize(config.compute_backend, threads)?;
+        let box_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()?,
+        );
         let client = Coordinator::new(config.coordinator_url.clone(), config.timeout())?;
         Ok(Self {
             config,
             client,
             backend,
+            box_pool,
             node_id,
         })
     }
@@ -53,16 +60,30 @@ impl Worker {
                     gpu_name: self.backend.gpu_name().unwrap_or("none").to_owned(),
                     processor_count,
                     memory_gb: memory_gb(),
-                    compute_backends: vec![Backend {
-                        id: self.backend.id(),
-                    }],
-                    workloads: vec![WorkloadCapability {
-                        workload_id: LOMB_SCARGLE_V1,
-                        execution_backends: vec![Backend {
-                            id: self.backend.id(),
-                        }],
-                        validator_id: None,
-                    }],
+                    compute_backends: if self.backend.id() == "cpu" {
+                        vec![Backend { id: "cpu" }]
+                    } else {
+                        vec![
+                            Backend {
+                                id: self.backend.id(),
+                            },
+                            Backend { id: "cpu" },
+                        ]
+                    },
+                    workloads: vec![
+                        WorkloadCapability {
+                            workload_id: LOMB_SCARGLE_V1,
+                            execution_backends: vec![Backend {
+                                id: self.backend.id(),
+                            }],
+                            validator_id: None,
+                        },
+                        WorkloadCapability {
+                            workload_id: BOX_PERIOD_SEARCH_V1,
+                            execution_backends: vec![Backend { id: "cpu" }],
+                            validator_id: None,
+                        },
+                    ],
                 },
             })
             .await?;
@@ -96,15 +117,16 @@ impl Worker {
             match claim {
                 Ok(batch) if !batch.is_empty() => {
                     backoff = self.config.poll_interval_ms;
-                    let (client, backend, node_id) = (
+                    let (client, backend, box_pool, node_id) = (
                         self.client.clone(),
                         self.backend.clone(),
+                        self.box_pool.clone(),
                         self.node_id.clone(),
                     );
                     let max = self.config.max_backoff_ms;
                     drop(tokio::spawn(async move {
                         let _permit = permit;
-                        process_batch(client, backend, node_id, batch, max).await;
+                        process_batch(client, backend, box_pool, node_id, batch, max).await;
                     }));
                 }
                 Ok(_) => {
@@ -148,9 +170,15 @@ async fn sleep_or_stop(duration: Duration, stop: &mut watch::Receiver<bool>) {
     tokio::select! { _ = tokio::time::sleep(duration) => {}, _ = stop.changed() => {} }
 }
 
+struct DatasetExecution {
+    shared_dataset: Option<Arc<Dataset>>,
+    started: Instant,
+}
+
 async fn process(
     client: Coordinator,
     backend: Arc<dyn ComputeBackend>,
+    box_pool: Arc<rayon::ThreadPool>,
     node_id: String,
     work: WorkUnit,
     max_backoff: u64,
@@ -158,11 +186,14 @@ async fn process(
     process_with_dataset(
         client,
         backend,
+        box_pool,
         node_id,
         work,
         max_backoff,
-        None,
-        Instant::now(),
+        DatasetExecution {
+            shared_dataset: None,
+            started: Instant::now(),
+        },
     )
     .await;
 }
@@ -170,6 +201,7 @@ async fn process(
 async fn process_batch(
     client: Coordinator,
     backend: Arc<dyn ComputeBackend>,
+    box_pool: Arc<rayon::ThreadPool>,
     node_id: String,
     batch: Vec<WorkUnit>,
     max_backoff: u64,
@@ -181,12 +213,18 @@ async fn process_batch(
                 && work.workload_id == first.workload_id
         })
     });
-    if !homogeneous || batch[0].workload_id != LOMB_SCARGLE_V1 {
+    if !homogeneous
+        || !matches!(
+            batch[0].workload_id.as_str(),
+            LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1
+        )
+    {
         warn!("non-homogeneous or unsupported batch; processing work units individually");
         for work in batch {
             process(
                 client.clone(),
                 backend.clone(),
+                box_pool.clone(),
                 node_id.clone(),
                 work,
                 max_backoff,
@@ -205,6 +243,7 @@ async fn process_batch(
                 process(
                     client.clone(),
                     backend.clone(),
+                    box_pool.clone(),
                     node_id.clone(),
                     work,
                     max_backoff,
@@ -225,11 +264,14 @@ async fn process_batch(
         process_with_dataset(
             client.clone(),
             backend.clone(),
+            box_pool.clone(),
             node_id.clone(),
             work,
             max_backoff,
-            Some(dataset.clone()),
-            started,
+            DatasetExecution {
+                shared_dataset: Some(dataset.clone()),
+                started,
+            },
         )
         .await;
     }
@@ -238,13 +280,17 @@ async fn process_batch(
 async fn process_with_dataset(
     client: Coordinator,
     backend: Arc<dyn ComputeBackend>,
+    box_pool: Arc<rayon::ThreadPool>,
     node_id: String,
     work: WorkUnit,
     max_backoff: u64,
-    shared_dataset: Option<Arc<Dataset>>,
-    started: Instant,
+    execution: DatasetExecution,
 ) {
-    let result = if work.workload_id != LOMB_SCARGLE_V1 {
+    let started = execution.started;
+    let result = if !matches!(
+        work.workload_id.as_str(),
+        LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1
+    ) {
         WorkResult::failed(
             &work.id,
             &node_id,
@@ -253,13 +299,59 @@ async fn process_with_dataset(
             format!("unsupported workload: {}", work.workload_id),
         )
     } else {
-        let dataset = match shared_dataset {
+        let dataset = match execution.shared_dataset {
             Some(dataset) => Ok(dataset),
             None => fetch_with_retry(&client, &work, max_backoff)
                 .await
                 .map(Arc::new),
         };
         match dataset {
+            Ok(dataset) if work.workload_id == BOX_PERIOD_SEARCH_V1 => match work
+                .box_period_payload()
+            {
+                Err(message) => WorkResult::failed(
+                    &work.id,
+                    &node_id,
+                    started.elapsed().as_secs_f64(),
+                    FailureKind::InvalidInput,
+                    message,
+                ),
+                Ok(payload) => {
+                    let computation = tokio::task::spawn_blocking(move || {
+                        let execution_started = Instant::now();
+                        let output = box_pool
+                            .install(|| crate::box_period_search::execute(&dataset, &payload));
+                        (output, execution_started.elapsed().as_secs_f64())
+                    })
+                    .await;
+                    match computation {
+                        Ok((Ok(output), execution_duration)) => WorkResult::completed_box_period(
+                            &work.id,
+                            &node_id,
+                            output,
+                            ExecutionDuration {
+                                backend: "cpu",
+                                seconds: execution_duration,
+                            },
+                            started.elapsed().as_secs_f64(),
+                        ),
+                        Ok((Err(error), _)) => WorkResult::failed(
+                            &work.id,
+                            &node_id,
+                            started.elapsed().as_secs_f64(),
+                            FailureKind::InvalidInput,
+                            error.to_string(),
+                        ),
+                        Err(error) => WorkResult::failed(
+                            &work.id,
+                            &node_id,
+                            started.elapsed().as_secs_f64(),
+                            FailureKind::Execution,
+                            error.to_string(),
+                        ),
+                    }
+                }
+            },
             Ok(dataset) => match work.lomb_payload() {
                 Err(message) => WorkResult::failed(
                     &work.id,
@@ -384,6 +476,15 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
+    fn test_box_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn backend_runtime_failure_is_not_invalid_input() {
         let error = crate::backend::BackendError::Execution(anyhow::anyhow!("device lost"));
@@ -490,7 +591,7 @@ mod tests {
             frequency_count: None,
             frequency_start_index: None,
         };
-        process(client, backend, "n".into(), work, 1).await;
+        process(client, backend, test_box_pool(), "n".into(), work, 1).await;
         submission.assert_async().await;
     }
 
@@ -508,6 +609,79 @@ mod tests {
             frequency_count: None,
             frequency_start_index: None,
         }
+    }
+
+    fn test_box_work(id: &str, project: &str, dataset: &str) -> WorkUnit {
+        WorkUnit {
+            id: id.into(),
+            project_id: project.into(),
+            workload_id: BOX_PERIOD_SEARCH_V1.into(),
+            dataset_id: dataset.into(),
+            payload: Some(serde_json::json!({
+                "startFrequency": 0.4, "frequencyStep": 0.05,
+                "frequencyCount": 5, "frequencyStartIndex": 20,
+                "phaseBinCount": 20, "durationFractions": [0.1, 0.15],
+                "minimumInBoxSamples": 4, "minimumOutOfBoxSamples": 20
+            })),
+            start_frequency: None,
+            frequency_step: None,
+            frequency_count: None,
+            frequency_start_index: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_box_work_executes_on_cpu_and_submits_generic_payload() {
+        let server = MockServer::start_async().await;
+        let coordinates = (0..80).map(|index| index as f32 * 0.25).collect::<Vec<_>>();
+        let values = coordinates
+            .iter()
+            .map(|time| {
+                let cycles = *time * 0.5;
+                if cycles - cycles.floor() < 0.15 {
+                    -2.0
+                } else {
+                    0.25
+                }
+            })
+            .collect::<Vec<_>>();
+        let dataset = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/v1/projects/p/datasets/d");
+                then.status(200).json_body(serde_json::json!({
+                    "coordinates": coordinates, "values": values
+                }));
+            })
+            .await;
+        let submission = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/work/box/result")
+                    .body_contains(r#""bestFrequencyIndex":22"#)
+                    .body_contains(r#""bestDurationIndex":1"#)
+                    .body_contains(r#""bestScore":"#);
+                then.status(200)
+                    .json_body(serde_json::json!({"accepted": true}));
+            })
+            .await;
+        let client = Coordinator::new(
+            Url::parse(&format!("{}/", server.base_url())).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let backend = backend::initialize(crate::backend::BackendChoice::Cpu, 1).unwrap();
+        process(
+            client,
+            backend,
+            test_box_pool(),
+            "n".into(),
+            test_box_work("box", "p", "d"),
+            1,
+        )
+        .await;
+        assert_eq!(dataset.hits_async().await, 1);
+        submission.assert_async().await;
     }
 
     #[tokio::test]
@@ -542,6 +716,7 @@ mod tests {
         process_batch(
             client,
             backend,
+            test_box_pool(),
             "n".into(),
             vec![test_work("w1", "p", "d"), test_work("w2", "p", "d")],
             1,
@@ -577,6 +752,7 @@ mod tests {
         process_batch(
             client,
             backend,
+            test_box_pool(),
             "n".into(),
             vec![test_work("w1", "p", "d1"), test_work("w2", "p", "d2")],
             1,
