@@ -177,7 +177,7 @@ pub struct WorkResult {
     pub node_id: String,
     pub status: ResultStatus,
     pub duration: f64,
-    pub payload: Option<Value>,
+    pub payload: Option<WorkResultPayload>,
     pub error_message: Option<String>,
     pub failure_kind: Option<FailureKind>,
     pub best_frequency: Option<f32>,
@@ -204,6 +204,29 @@ pub struct ResultPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_duration_seconds: Option<f64>,
     pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoxPeriodResultPayload {
+    pub best_frequency: f32,
+    pub best_score: f32,
+    pub best_phase: f32,
+    pub best_duration_fraction: f32,
+    pub best_frequency_index: usize,
+    pub best_duration_index: usize,
+    pub best_phase_bin: usize,
+    pub in_box_samples: usize,
+    pub out_of_box_samples: usize,
+    pub cpu_duration_seconds: f64,
+    pub total_workload_duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum WorkResultPayload {
+    Lomb(ResultPayload),
+    BoxPeriod(BoxPeriodResultPayload),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -253,7 +276,7 @@ impl WorkResult {
             node_id: node_id.into(),
             status: ResultStatus::Completed,
             duration: total_duration,
-            payload: Some(serde_json::to_value(payload).expect("result payload serializes")),
+            payload: Some(WorkResultPayload::Lomb(payload)),
             error_message: None,
             failure_kind: None,
             best_frequency: Some(result.best_frequency),
@@ -269,30 +292,26 @@ impl WorkResult {
         execution_duration: ExecutionDuration,
         total_duration: f64,
     ) -> Self {
-        let mut payload = serde_json::json!({
-            "bestFrequency": result.best_frequency,
-            "bestScore": result.best_score,
-            "bestPhase": result.best_phase,
-            "bestDurationFraction": result.best_duration_fraction,
-            "bestFrequencyIndex": result.best_frequency_index,
-            "bestDurationIndex": result.best_duration_index,
-            "bestPhaseBin": result.best_phase_bin,
-            "inBoxSamples": result.in_box_samples,
-            "outOfBoxSamples": result.out_of_box_samples,
-            "totalWorkloadDurationSeconds": total_duration,
-        });
-        if execution_duration.backend == "cpu" {
-            payload.as_object_mut().expect("object").insert(
-                "cpuDurationSeconds".into(),
-                serde_json::json!(execution_duration.seconds),
-            );
-        }
+        debug_assert_eq!(execution_duration.backend, "cpu");
+        let payload = BoxPeriodResultPayload {
+            best_frequency: result.best_frequency,
+            best_score: result.best_score,
+            best_phase: result.best_phase,
+            best_duration_fraction: result.best_duration_fraction,
+            best_frequency_index: result.best_frequency_index,
+            best_duration_index: result.best_duration_index,
+            best_phase_bin: result.best_phase_bin,
+            in_box_samples: result.in_box_samples,
+            out_of_box_samples: result.out_of_box_samples,
+            cpu_duration_seconds: execution_duration.seconds,
+            total_workload_duration_seconds: total_duration,
+        };
         Self {
             work_unit_id: work_id.into(),
             node_id: node_id.into(),
             status: ResultStatus::Completed,
             duration: total_duration,
-            payload: Some(payload),
+            payload: Some(WorkResultPayload::BoxPeriod(payload)),
             error_message: None,
             failure_kind: None,
             best_frequency: None,
