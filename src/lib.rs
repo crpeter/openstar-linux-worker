@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod box_period_search;
 pub mod client;
 pub mod config;
 pub mod kernel;
