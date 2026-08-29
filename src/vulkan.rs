@@ -6,10 +6,12 @@ use crate::{
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use ash::{vk, Entry};
 use std::{
+    env,
     ffi::{CStr, CString},
     mem::size_of_val,
     ptr,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
@@ -28,7 +30,104 @@ struct Context {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
+    profiling: Profiling,
     resources: Option<ExecutionResources>,
+}
+
+struct Profiling {
+    enabled: bool,
+    timestamp_supported: bool,
+    query_pool: Option<vk::QueryPool>,
+    timestamp_valid_bits: u32,
+    timestamp_period_ns: f32,
+}
+
+#[derive(Default)]
+struct WorkUnitTimings {
+    validate: Duration,
+    host_write: Duration,
+    command_record: Duration,
+    queue_submit: Duration,
+    queue_wait: Duration,
+    gpu_dispatch: Option<Duration>,
+    gpu_timestamp_valid: bool,
+    readback: Duration,
+    winner_select: Duration,
+    cpu_refinement: Duration,
+}
+
+#[derive(Debug, PartialEq)]
+struct CandidateRanks {
+    window: usize,
+    global: usize,
+    gpu_power: f32,
+}
+
+fn profiling_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_since(start: Option<Instant>) -> Duration {
+    start.map_or(Duration::ZERO, |start| start.elapsed())
+}
+
+fn timestamp_elapsed(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> Duration {
+    let mask = if valid_bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << valid_bits) - 1
+    };
+    let ticks = end.wrapping_sub(start) & mask;
+    Duration::from_secs_f64(ticks as f64 * f64::from(period_ns) / 1_000_000_000.0)
+}
+
+fn timestamp_is_sane(gpu_elapsed: Duration, host_submission_elapsed: Duration) -> bool {
+    !gpu_elapsed.is_zero() && gpu_elapsed <= host_submission_elapsed
+}
+
+fn rank_is_covered(rank: usize, candidate_count: usize) -> bool {
+    rank > 0 && rank <= candidate_count
+}
+
+fn candidate_ranks(
+    powers: &[f32],
+    target: usize,
+    window: std::ops::RangeInclusive<usize>,
+) -> std::result::Result<CandidateRanks, ComputeError> {
+    if powers.is_empty()
+        || target >= powers.len()
+        || !window.contains(&target)
+        || *window.end() >= powers.len()
+    {
+        return Err(ComputeError::InvalidCount);
+    }
+    if powers.iter().any(|power| !power.is_finite()) {
+        return Err(ComputeError::InvalidResult);
+    }
+    let target_power = powers[target];
+    let precedes_target = |(index, power): (usize, &f32)| {
+        power.total_cmp(&target_power).is_gt()
+            || (power.total_cmp(&target_power).is_eq() && index < target)
+    };
+    let global = 1 + powers
+        .iter()
+        .enumerate()
+        .filter(|item| precedes_target(*item))
+        .count();
+    let window_rank = 1 + window
+        .clone()
+        .filter(|&index| precedes_target((index, &powers[index])))
+        .count();
+    Ok(CandidateRanks {
+        window: window_rank,
+        global,
+        gpu_power: target_power,
+    })
 }
 
 pub(crate) fn choose_queue(flags: &[vk::QueueFlags]) -> Option<u32> {
@@ -119,6 +218,26 @@ impl VulkanBackend {
         }
         .context("create Vulkan device")?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let profiling_enabled = profiling_flag(env::var("OPENSTAR_VULKAN_PROFILE").ok().as_deref());
+        let queue_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let timestamp_valid_bits = queue_properties[queue_family as usize].timestamp_valid_bits;
+        let timestamps_supported = timestamp_valid_bits > 0
+            && properties.limits.timestamp_period.is_finite()
+            && properties.limits.timestamp_period > 0.0;
+        let query_pool = if profiling_enabled && timestamps_supported {
+            unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            }
+            .ok()
+        } else {
+            None
+        };
         let bindings = [0, 1, 2].map(|binding| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
@@ -184,6 +303,13 @@ impl VulkanBackend {
                 pipeline_layout,
                 pipeline,
                 command_pool,
+                profiling: Profiling {
+                    enabled: profiling_enabled,
+                    timestamp_supported: timestamps_supported,
+                    query_pool,
+                    timestamp_valid_bits,
+                    timestamp_period_ns: properties.limits.timestamp_period,
+                },
                 resources: None,
             }),
         })
@@ -369,10 +495,17 @@ impl Context {
         dataset: &Dataset,
         p: &LombPayload,
     ) -> std::result::Result<LombResult, BackendError> {
+        let profile = self.profiling.enabled;
+        let total_start = profile.then(Instant::now);
+        let phase_start = profile.then(Instant::now);
         let (x, y, normalization) = kernel::validate(dataset, p)?;
         if u32::try_from(x.len()).is_err() || u32::try_from(p.frequency_count).is_err() {
             return Err(ComputeError::InvalidCount.into());
         }
+        let mut timings = WorkUnitTimings {
+            validate: elapsed_since(phase_start),
+            ..WorkUnitTimings::default()
+        };
         let mut run = || -> Result<Vec<f32>> {
             let x_size = size_of_val(x);
             let y_size = size_of_val(y);
@@ -386,8 +519,11 @@ impl Context {
                 self.grow_buffer(&mut resources.y, y_size)?;
                 self.grow_buffer(&mut resources.output, output_size)?;
                 unsafe {
+                    let phase_start = profile.then(Instant::now);
                     Self::write(&resources.x, x);
                     Self::write(&resources.y, y);
+                    timings.host_write = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
                     let infos = [
                         resources.x.buffer,
                         resources.y.buffer,
@@ -414,6 +550,9 @@ impl Context {
                         &vk::CommandBufferBeginInfo::default()
                             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                     )?;
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_reset_query_pool(cmd, query_pool, 0, 2);
+                    }
                     self.device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -441,24 +580,77 @@ impl Context {
                         0,
                         std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 20),
                     );
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            query_pool,
+                            0,
+                        );
+                    }
                     self.device
                         .cmd_dispatch(cmd, (p.frequency_count as u32).div_ceil(64), 1, 1);
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        self.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            query_pool,
+                            1,
+                        );
+                    }
                     self.device.end_command_buffer(cmd)?;
+                    timings.command_record = elapsed_since(phase_start);
                     let cmds = [cmd];
+                    let phase_start = profile.then(Instant::now);
                     self.device.queue_submit(
                         self.queue,
                         &[vk::SubmitInfo::default().command_buffers(&cmds)],
                         vk::Fence::null(),
                     )?;
+                    timings.queue_submit = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
                     self.device.queue_wait_idle(self.queue)?;
-                    Ok(Self::read_f32(&resources.output, p.frequency_count))
+                    timings.queue_wait = elapsed_since(phase_start);
+                    let phase_start = profile.then(Instant::now);
+                    if let Some(query_pool) = self.profiling.query_pool {
+                        let mut timestamps = [0_u64; 2];
+                        if self
+                            .device
+                            .get_query_pool_results(
+                                query_pool,
+                                0,
+                                &mut timestamps,
+                                vk::QueryResultFlags::TYPE_64,
+                            )
+                            .is_ok()
+                        {
+                            let gpu_elapsed = timestamp_elapsed(
+                                timestamps[0],
+                                timestamps[1],
+                                self.profiling.timestamp_valid_bits,
+                                self.profiling.timestamp_period_ns,
+                            );
+                            timings.gpu_timestamp_valid = timestamp_is_sane(
+                                gpu_elapsed,
+                                timings.queue_submit + timings.queue_wait,
+                            );
+                            if timings.gpu_timestamp_valid {
+                                timings.gpu_dispatch = Some(gpu_elapsed);
+                            }
+                        }
+                    }
+                    let powers = Self::read_f32(&resources.output, p.frequency_count);
+                    timings.readback = elapsed_since(phase_start);
+                    Ok(powers)
                 }
             })();
             self.resources = Some(resources);
             result
         };
         let powers = run().map_err(BackendError::Execution)?;
+        let phase_start = profile.then(Instant::now);
         let gpu_winner = kernel::select_winner(p, &powers).map_err(BackendError::InvalidInput)?;
+        timings.winner_select = elapsed_since(phase_start);
         let chunk_winner = gpu_winner
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
@@ -467,9 +659,11 @@ impl Context {
             .map_err(BackendError::InvalidInput)?;
         let refinement_start = *refinement_range.start();
         let refinement_end = *refinement_range.end();
+        let phase_start = profile.then(Instant::now);
         let refined = refinement_pool
             .install(|| kernel::refine_winner(dataset, p, chunk_winner))
             .map_err(BackendError::InvalidInput)?;
+        timings.cpu_refinement = elapsed_since(phase_start);
         let refined_chunk_winner = refined
             .best_frequency_index
             .checked_sub(p.frequency_start_index)
@@ -485,6 +679,18 @@ impl Context {
             refinement_end,
             refined_chunk_winner,
         );
+        let ranks = if profile {
+            Some(
+                candidate_ranks(
+                    &powers,
+                    refined_chunk_winner,
+                    refinement_start..=refinement_end,
+                )
+                .map_err(BackendError::InvalidInput)?,
+            )
+        } else {
+            None
+        };
         debug!(
             raw_gpu_winner_index = chunk_winner,
             raw_gpu_winner_power = gpu_winner.best_power,
@@ -498,6 +704,40 @@ impl Context {
             refined_winner_on_refinement_radius_edge,
             "Vulkan work unit CPU refinement completed"
         );
+        if profile {
+            let ranks = ranks.expect("candidate ranks are calculated when profiling is enabled");
+            info!(
+                vulkan_profile = true,
+                frequency_count = p.frequency_count,
+                sample_count = x.len(),
+                validate_ms = timings.validate.as_secs_f64() * 1_000.0,
+                host_write_ms = timings.host_write.as_secs_f64() * 1_000.0,
+                command_record_ms = timings.command_record.as_secs_f64() * 1_000.0,
+                queue_submit_ms = timings.queue_submit.as_secs_f64() * 1_000.0,
+                queue_wait_ms = timings.queue_wait.as_secs_f64() * 1_000.0,
+                gpu_timestamp_supported = self.profiling.timestamp_supported,
+                gpu_timestamp_valid = timings.gpu_timestamp_valid,
+                gpu_dispatch_ms = timings
+                    .gpu_dispatch
+                    .map(|duration| duration.as_secs_f64() * 1_000.0),
+                readback_ms = timings.readback.as_secs_f64() * 1_000.0,
+                winner_select_ms = timings.winner_select.as_secs_f64() * 1_000.0,
+                cpu_refinement_ms = timings.cpu_refinement.as_secs_f64() * 1_000.0,
+                refinement_window_size = refinement_end - refinement_start + 1,
+                refined_winner_gpu_rank_in_window = ranks.window,
+                refined_winner_gpu_rank_global = ranks.global,
+                gpu_power_at_refined_winner = ranks.gpu_power,
+                refined_winner_in_gpu_top_1 = rank_is_covered(ranks.window, 1),
+                refined_winner_in_gpu_top_2 = rank_is_covered(ranks.window, 2),
+                refined_winner_in_gpu_top_4 = rank_is_covered(ranks.window, 4),
+                refined_winner_in_gpu_top_8 = rank_is_covered(ranks.window, 8),
+                refined_winner_in_gpu_top_16 = rank_is_covered(ranks.window, 16),
+                refined_winner_in_gpu_top_32 = rank_is_covered(ranks.window, 32),
+                refined_winner_in_gpu_top_64 = rank_is_covered(ranks.window, 64),
+                total_ms = elapsed_since(total_start).as_secs_f64() * 1_000.0,
+                "Vulkan work unit profile"
+            );
+        }
         Ok(refined)
     }
 }
@@ -536,6 +776,9 @@ impl Drop for Context {
                 self.device
                     .destroy_descriptor_pool(resources.descriptor_pool, None);
             }
+            if let Some(query_pool) = self.profiling.query_pool {
+                self.device.destroy_query_pool(query_pool, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
@@ -571,6 +814,89 @@ mod tests {
         assert!(capacity_sufficient(1024, 1024));
         assert!(!capacity_sufficient(1024, 1025));
         assert!(capacity_sufficient(4, 0));
+    }
+
+    #[test]
+    fn profiling_is_opt_in_and_accepts_common_true_values() {
+        assert!(!profiling_flag(None));
+        assert!(!profiling_flag(Some("")));
+        assert!(!profiling_flag(Some("0")));
+        assert!(!profiling_flag(Some("false")));
+        assert!(profiling_flag(Some("1")));
+        assert!(profiling_flag(Some(" TRUE ")));
+        assert!(profiling_flag(Some("yes")));
+        assert!(profiling_flag(Some("on")));
+    }
+
+    #[test]
+    fn timestamp_elapsed_handles_queue_counter_wraparound() {
+        assert_eq!(
+            timestamp_elapsed(100, 150, 64, 2.0),
+            Duration::from_nanos(100)
+        );
+        assert_eq!(timestamp_elapsed(250, 5, 8, 1.0), Duration::from_nanos(11));
+    }
+
+    #[test]
+    fn timestamp_sanity_rejects_zero_and_impossible_elapsed_times() {
+        assert!(!timestamp_is_sane(Duration::ZERO, Duration::from_millis(7)));
+        assert!(timestamp_is_sane(
+            Duration::from_millis(6),
+            Duration::from_millis(7)
+        ));
+        assert!(!timestamp_is_sane(
+            Duration::from_millis(24),
+            Duration::from_millis(7)
+        ));
+    }
+
+    #[test]
+    fn candidate_rank_one_and_known_lower_rank_are_reported() {
+        let powers = [0.2, 0.9, 0.6, 0.4];
+        assert_eq!(
+            candidate_ranks(&powers, 1, 0..=3).unwrap(),
+            CandidateRanks {
+                window: 1,
+                global: 1,
+                gpu_power: 0.9,
+            }
+        );
+        assert_eq!(
+            candidate_ranks(&powers, 3, 0..=3).unwrap(),
+            CandidateRanks {
+                window: 3,
+                global: 3,
+                gpu_power: 0.4,
+            }
+        );
+    }
+
+    #[test]
+    fn candidate_rank_ties_prefer_the_lower_frequency_index() {
+        let powers = [0.1, 0.8, 0.8, 0.8];
+        assert_eq!(candidate_ranks(&powers, 1, 0..=3).unwrap().window, 1);
+        assert_eq!(candidate_ranks(&powers, 2, 0..=3).unwrap().window, 2);
+        assert_eq!(candidate_ranks(&powers, 3, 0..=3).unwrap().window, 3);
+    }
+
+    #[test]
+    fn candidate_window_rank_ignores_higher_powers_outside_the_window() {
+        let powers = [0.99, 0.98, 0.5, 0.7, 0.6, 0.97];
+        assert_eq!(
+            candidate_ranks(&powers, 2, 2..=4).unwrap(),
+            CandidateRanks {
+                window: 3,
+                global: 6,
+                gpu_power: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn top_n_coverage_includes_its_boundary_only() {
+        assert!(rank_is_covered(8, 8));
+        assert!(!rank_is_covered(9, 8));
+        assert!(!rank_is_covered(0, 8));
     }
 
     #[test]
