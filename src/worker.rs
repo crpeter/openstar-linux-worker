@@ -170,6 +170,11 @@ async fn sleep_or_stop(duration: Duration, stop: &mut watch::Receiver<bool>) {
     tokio::select! { _ = tokio::time::sleep(duration) => {}, _ = stop.changed() => {} }
 }
 
+struct DatasetExecution {
+    shared_dataset: Option<Arc<Dataset>>,
+    started: Instant,
+}
+
 async fn process(
     client: Coordinator,
     backend: Arc<dyn ComputeBackend>,
@@ -185,8 +190,10 @@ async fn process(
         node_id,
         work,
         max_backoff,
-        None,
-        Instant::now(),
+        DatasetExecution {
+            shared_dataset: None,
+            started: Instant::now(),
+        },
     )
     .await;
 }
@@ -261,8 +268,10 @@ async fn process_batch(
             node_id.clone(),
             work,
             max_backoff,
-            Some(dataset.clone()),
-            started,
+            DatasetExecution {
+                shared_dataset: Some(dataset.clone()),
+                started,
+            },
         )
         .await;
     }
@@ -275,9 +284,9 @@ async fn process_with_dataset(
     node_id: String,
     work: WorkUnit,
     max_backoff: u64,
-    shared_dataset: Option<Arc<Dataset>>,
-    started: Instant,
+    execution: DatasetExecution,
 ) {
+    let started = execution.started;
     let result = if !matches!(
         work.workload_id.as_str(),
         LOMB_SCARGLE_V1 | BOX_PERIOD_SEARCH_V1
@@ -290,7 +299,7 @@ async fn process_with_dataset(
             format!("unsupported workload: {}", work.workload_id),
         )
     } else {
-        let dataset = match shared_dataset {
+        let dataset = match execution.shared_dataset {
             Some(dataset) => Ok(dataset),
             None => fetch_with_retry(&client, &work, max_backoff)
                 .await
